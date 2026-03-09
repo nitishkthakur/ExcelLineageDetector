@@ -1,0 +1,463 @@
+{
+  "file": "/home/nitish/Documents/github/ExcelLineageDetector/tests/fixtures/debug_test.xlsx",
+  "scanned_at": "2026-03-09T03:52:59.141076Z",
+  "summary": {
+    "total_connections": 21,
+    "by_category": {
+      "database": 3,
+      "web": 2,
+      "powerquery": 4,
+      "file": 5,
+      "hyperlink": 3,
+      "metadata": 4
+    },
+    "by_subtype": {
+      "sql_server": 2,
+      "oracle": 1,
+      "web_query": 1,
+      "odbc": 1,
+      "web": 1,
+      "file_csv": 1,
+      "unknown": 1,
+      "external_workbook": 2,
+      "unc_path": 2,
+      "webservice": 1,
+      "http": 1,
+      "file_url": 1,
+      "named_range_external": 1,
+      "comment_url": 1,
+      "core_properties": 1,
+      "app_properties": 1,
+      "custom_property_file_path": 1,
+      "custom_property_url": 1
+    }
+  },
+  "connections": [
+    {
+      "id": "dat_9851c3f7dc35",
+      "category": "database",
+      "sub_type": "sql_server",
+      "source": "sql-server.corp.local/SalesDB",
+      "raw_connection": "Driver={SQL Server};Server=sql-server.corp.local;Database=SalesDB;Trusted_Connection=Yes;",
+      "location": "connections.xml",
+      "query_text": "SELECT * FROM dbo.SalesFact WHERE Year = 2023",
+      "parsed_query": null,
+      "author": null,
+      "created_at": null,
+      "modified_at": null,
+      "metadata": {
+        "conn_id": "1",
+        "conn_name": "SalesDB_ODBC",
+        "type": "1",
+        "refreshed_version": "3",
+        "background": "1",
+        "save_password": "0"
+      },
+      "confidence": 1.0
+    },
+    {
+      "id": "dat_176113ecad76",
+      "category": "database",
+      "sub_type": "oracle",
+      "source": "oracle-db.corp.local:1521/FINDB",
+      "raw_connection": "Provider=OraOLEDB.Oracle;Data Source=oracle-db.corp.local:1521/FINDB;User Id=finance_user;Password=***;",
+      "location": "connections.xml",
+      "query_text": "SELECT account_id, amount FROM gl_balances WHERE period_year = 2023",
+      "parsed_query": null,
+      "author": null,
+      "created_at": null,
+      "modified_at": null,
+      "metadata": {
+        "conn_id": "2",
+        "conn_name": "OracleFinance_OleDB",
+        "type": "4",
+        "refreshed_version": "3",
+        "background": "0",
+        "save_password": "0"
+      },
+      "confidence": 1.0
+    },
+    {
+      "id": "web_833994409553",
+      "category": "web",
+      "sub_type": "web_query",
+      "source": "https://data.worldbank.org/api/v2/country/US/indicator/NY.GDP.MKTP.CD?format=jso",
+      "raw_connection": "https://data.worldbank.org/api/v2/country/US/indicator/NY.GDP.MKTP.CD?format=json",
+      "location": "connections.xml",
+      "query_text": null,
+      "parsed_query": null,
+      "author": null,
+      "created_at": null,
+      "modified_at": null,
+      "metadata": {
+        "conn_id": "3",
+        "conn_name": "ExternalWebQuery",
+        "type": "3",
+        "refreshed_version": "2",
+        "background": "0",
+        "save_password": "0"
+      },
+      "confidence": 1.0
+    },
+    {
+      "id": "dat_3949822081ed",
+      "category": "database",
+      "sub_type": "odbc",
+      "source": "$Workbook$",
+      "raw_connection": "Provider=Microsoft.Mashup.OleDb.1;Data Source=$Workbook$;Location=SalesQuery;Extended Properties=\"\";",
+      "location": "connections.xml",
+      "query_text": "SELECT * FROM [SalesQuery]",
+      "parsed_query": null,
+      "author": null,
+      "created_at": null,
+      "modified_at": null,
+      "metadata": {
+        "conn_id": "4",
+        "conn_name": "Query - SalesQuery",
+        "type": "5",
+        "refreshed_version": "3",
+        "background": "0",
+        "save_password": "0"
+      },
+      "confidence": 1.0
+    },
+    {
+      "id": "pow_9bc420b08da9",
+      "category": "powerquery",
+      "sub_type": "sql_server",
+      "source": "sql-server.corp.local/SalesDB",
+      "raw_connection": "sql-server.corp.local/SalesDB",
+      "location": "xl/customXml/item0.xml",
+      "query_text": "let\n    Source = Sql.Database(\"sql-server.corp.local\", \"SalesDB\"),\n    dbo_SalesFact = Source{[Schema=\"dbo\",Item=\"SalesFact\"]}[Data],\n    #\"Filtered Rows\" = Table.SelectRows(dbo_SalesFact, each [Year] = 2023)\nin\n    #\"Filtered Rows\"",
+      "parsed_query": null,
+      "author": null,
+      "created_at": null,
+      "modified_at": null,
+      "metadata": {
+        "query_name": "SalesData",
+        "description": "Loads sales data from SQL Server",
+        "details": {
+          "server": "sql-server.corp.local",
+          "database": "SalesDB"
+        }
+      },
+      "confidence": 1.0
+    },
+    {
+      "id": "pow_44c4a3c8ef4f",
+      "category": "powerquery",
+      "sub_type": "web",
+      "source": "https://api.exchangerate.host/latest",
+      "raw_connection": "https://api.exchangerate.host/latest",
+      "location": "xl/customXml/item0.xml",
+      "query_text": "let\n    Source = Web.Contents(\"https://api.exchangerate.host/latest\"),\n    ParsedJson = Json.Document(Source)\nin\n    ParsedJson",
+      "parsed_query": null,
+      "author": null,
+      "created_at": null,
+      "modified_at": null,
+      "metadata": {
+        "query_name": "ExchangeRates",
+        "description": "Fetches live exchange rates from web API",
+        "details": {
+          "path_or_url": "https://api.exchangerate.host/latest"
+        }
+      },
+      "confidence": 1.0
+    },
+    {
+      "id": "pow_98c5d2abdcca",
+      "category": "powerquery",
+      "sub_type": "file_csv",
+      "source": "C:\\\\data\\\\input\\\\sales_export.csv",
+      "raw_connection": "C:\\\\data\\\\input\\\\sales_export.csv",
+      "location": "xl/customXml/item0.xml",
+      "query_text": "let\n    Source = Csv.Document(File.Contents(\"C:\\\\data\\\\input\\\\sales_export.csv\"), [Delimiter=\",\", Encoding=65001, QuoteStyle=QuoteStyle.None]),\n    #\"Promoted Headers\" = Table.PromoteHeaders(Source)\nin\n    #\"Promoted Headers\"",
+      "parsed_query": null,
+      "author": null,
+      "created_at": null,
+      "modified_at": null,
+      "metadata": {
+        "query_name": "LocalFileData",
+        "description": "Reads data from a local CSV file",
+        "details": {
+          "path_or_url": "C:\\\\data\\\\input\\\\sales_export.csv"
+        }
+      },
+      "confidence": 1.0
+    },
+    {
+      "id": "pow_3bc737bf6ba7",
+      "category": "powerquery",
+      "sub_type": "unknown",
+      "source": "SalesQuery",
+      "raw_connection": "Provider=Microsoft.Mashup.OleDb.1;Data Source=$Workbook$;Location=SalesQuery;Extended Properties=\"\";",
+      "location": "connections.xml",
+      "query_text": "SELECT * FROM [SalesQuery]",
+      "parsed_query": null,
+      "author": null,
+      "created_at": null,
+      "modified_at": null,
+      "metadata": {
+        "query_name": "SalesQuery",
+        "details": {}
+      },
+      "confidence": 1.0
+    },
+    {
+      "id": "fil_b6f68938aad5",
+      "category": "file",
+      "sub_type": "external_workbook",
+      "source": "source_data.xlsx",
+      "raw_connection": "source_data.xlsx",
+      "location": "Sheet1!A10",
+      "query_text": "='[source_data.xlsx]Sheet1'!A1",
+      "parsed_query": null,
+      "author": null,
+      "created_at": null,
+      "modified_at": null,
+      "metadata": {
+        "workbook_path": "",
+        "workbook_name": "source_data.xlsx",
+        "sheet": "Sheet1",
+        "cell_ref": "A1",
+        "full_ref": "'[source_data.xlsx]Sheet1'!A1"
+      },
+      "confidence": 0.95
+    },
+    {
+      "id": "fil_0510569f0e9f",
+      "category": "file",
+      "sub_type": "unc_path",
+      "source": "quarterly.xlsx",
+      "raw_connection": "\\\\fileserver\\share\\",
+      "location": "Sheet1!A11",
+      "query_text": "='\\\\fileserver\\share\\[quarterly.xlsx]Q1'!B2",
+      "parsed_query": null,
+      "author": null,
+      "created_at": null,
+      "modified_at": null,
+      "metadata": {
+        "workbook_path": "\\\\fileserver\\share\\",
+        "workbook_name": "quarterly.xlsx",
+        "sheet": "Q1",
+        "cell_ref": "B2",
+        "full_ref": "'\\\\fileserver\\share\\[quarterly.xlsx]Q1'!B2"
+      },
+      "confidence": 0.95
+    },
+    {
+      "id": "for_c448f6ffc7ac",
+      "category": "web",
+      "sub_type": "webservice",
+      "source": "https://api.exchangerate.host/latest",
+      "raw_connection": "https://api.exchangerate.host/latest",
+      "location": "Sheet1!A12",
+      "query_text": "=WEBSERVICE(\"https://api.exchangerate.host/latest\")",
+      "parsed_query": null,
+      "author": null,
+      "created_at": null,
+      "modified_at": null,
+      "metadata": {},
+      "confidence": 0.95
+    },
+    {
+      "id": "fil_221bdca3dc18",
+      "category": "file",
+      "sub_type": "external_workbook",
+      "source": "external_source.xlsx",
+      "raw_connection": "external_source.xlsx",
+      "location": "HiddenData!A1",
+      "query_text": "='[external_source.xlsx]DataSheet'!C5",
+      "parsed_query": null,
+      "author": null,
+      "created_at": null,
+      "modified_at": null,
+      "metadata": {
+        "workbook_path": "",
+        "workbook_name": "external_source.xlsx",
+        "sheet": "DataSheet",
+        "cell_ref": "C5",
+        "full_ref": "'[external_source.xlsx]DataSheet'!C5"
+      },
+      "confidence": 0.95
+    },
+    {
+      "id": "hyp_14979a54e0b9",
+      "category": "hyperlink",
+      "sub_type": "http",
+      "source": "https://example.com/data-source",
+      "raw_connection": "https://example.com/data-source",
+      "location": "Sheet1:A5",
+      "query_text": null,
+      "parsed_query": null,
+      "author": null,
+      "created_at": null,
+      "modified_at": null,
+      "metadata": {
+        "cell_ref": "A5",
+        "display_text": "",
+        "sheet": "Sheet1",
+        "is_external": true
+      },
+      "confidence": 1.0
+    },
+    {
+      "id": "hyp_98728b194ab1",
+      "category": "hyperlink",
+      "sub_type": "file_url",
+      "source": "file:///C:/data/source_data.xlsx",
+      "raw_connection": "file:///C:/data/source_data.xlsx",
+      "location": "Sheet1:A6",
+      "query_text": null,
+      "parsed_query": null,
+      "author": null,
+      "created_at": null,
+      "modified_at": null,
+      "metadata": {
+        "cell_ref": "A6",
+        "display_text": "",
+        "sheet": "Sheet1",
+        "is_external": true
+      },
+      "confidence": 1.0
+    },
+    {
+      "id": "fil_b8225ef2c672",
+      "category": "file",
+      "sub_type": "named_range_external",
+      "source": "budget.xlsx",
+      "raw_connection": "budget.xlsx",
+      "location": "workbook.xml:definedNames",
+      "query_text": "'[budget.xlsx]Summary'!$A$1:$Z$100",
+      "parsed_query": null,
+      "author": null,
+      "created_at": null,
+      "modified_at": null,
+      "metadata": {
+        "defined_name": "ExternalBudget",
+        "formula": "'[budget.xlsx]Summary'!$A$1:$Z$100",
+        "hidden": "0",
+        "local_sheet_id": "",
+        "parsed": {
+          "workbook_path": "",
+          "workbook_name": "budget.xlsx",
+          "sheet": "Summary",
+          "cell_ref": "$A$1:$Z$100",
+          "full_ref": "'[budget.xlsx]Summary'!$A$1:$Z$100"
+        }
+      },
+      "confidence": 0.9
+    },
+    {
+      "id": "hyp_9e0719234a5e",
+      "category": "hyperlink",
+      "sub_type": "comment_url",
+      "source": "https://api.data.gov/economic/v1/stats",
+      "raw_connection": "https://api.data.gov/economic/v1/stats",
+      "location": "Sheet1:comment",
+      "query_text": null,
+      "parsed_query": null,
+      "author": null,
+      "created_at": null,
+      "modified_at": null,
+      "metadata": {
+        "source_file": "xl/comments/comment1.xml",
+        "comment_text": "Data sourced from https://api.data.gov/economic/v1/stats and also from \\\\fileserver\\reports\\quarterly.xlsx"
+      },
+      "confidence": 0.7
+    },
+    {
+      "id": "fil_237362690eff",
+      "category": "file",
+      "sub_type": "unc_path",
+      "source": "\\\\fileserver\\reports\\quarterly.xlsx",
+      "raw_connection": "\\\\fileserver\\reports\\quarterly.xlsx",
+      "location": "Sheet1:comment",
+      "query_text": null,
+      "parsed_query": null,
+      "author": null,
+      "created_at": null,
+      "modified_at": null,
+      "metadata": {
+        "source_file": "xl/comments/comment1.xml",
+        "comment_text": "Data sourced from https://api.data.gov/economic/v1/stats and also from \\\\fileserver\\reports\\quarterly.xlsx"
+      },
+      "confidence": 0.6
+    },
+    {
+      "id": "met_38e9c5d4cd6f",
+      "category": "metadata",
+      "sub_type": "core_properties",
+      "source": "Document Core Properties",
+      "raw_connection": "docProps/core.xml",
+      "location": "docProps/core.xml",
+      "query_text": null,
+      "parsed_query": null,
+      "author": "openpyxl",
+      "created_at": "2026-03-08T20:09:35Z",
+      "modified_at": "2026-03-08T20:09:35Z",
+      "metadata": {
+        "creator": "openpyxl",
+        "created": "2026-03-08T20:09:35Z",
+        "modified": "2026-03-08T20:09:35Z"
+      },
+      "confidence": 1.0
+    },
+    {
+      "id": "met_96908b5aded1",
+      "category": "metadata",
+      "sub_type": "app_properties",
+      "source": "Microsoft Excel Compatible / Openpyxl 3.1.5",
+      "raw_connection": "docProps/app.xml",
+      "location": "docProps/app.xml",
+      "query_text": null,
+      "parsed_query": null,
+      "author": null,
+      "created_at": null,
+      "modified_at": null,
+      "metadata": {
+        "Application": "Microsoft Excel Compatible / Openpyxl 3.1.5",
+        "AppVersion": "3.1"
+      },
+      "confidence": 1.0
+    },
+    {
+      "id": "met_b4308070623c",
+      "category": "metadata",
+      "sub_type": "custom_property_file_path",
+      "source": "DataSourcePath: \\\\fileserver\\shared\\datasets\\master_data.xlsx",
+      "raw_connection": "\\\\fileserver\\shared\\datasets\\master_data.xlsx",
+      "location": "docProps/custom.xml:DataSourcePath",
+      "query_text": null,
+      "parsed_query": null,
+      "author": null,
+      "created_at": null,
+      "modified_at": null,
+      "metadata": {
+        "property_name": "DataSourcePath",
+        "property_value": "\\\\fileserver\\shared\\datasets\\master_data.xlsx",
+        "fmtid": "{D5CDD505-2E9C-101B-9397-08002B2CF9AE}"
+      },
+      "confidence": 0.8
+    },
+    {
+      "id": "met_be0448f59316",
+      "category": "metadata",
+      "sub_type": "custom_property_url",
+      "source": "ReportingServer: https://reporting.corp.local/api/v2/reports",
+      "raw_connection": "https://reporting.corp.local/api/v2/reports",
+      "location": "docProps/custom.xml:ReportingServer",
+      "query_text": null,
+      "parsed_query": null,
+      "author": null,
+      "created_at": null,
+      "modified_at": null,
+      "metadata": {
+        "property_name": "ReportingServer",
+        "property_value": "https://reporting.corp.local/api/v2/reports",
+        "fmtid": "{D5CDD505-2E9C-101B-9397-08002B2CF9AE}"
+      },
+      "confidence": 0.8
+    }
+  ]
+}
