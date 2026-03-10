@@ -61,12 +61,14 @@ class QueryTableExtractor(BaseExtractor):
 
             db_pr = conn_el.find(f"{{{NS}}}dbPr") or conn_el.find("dbPr") or conn_el.find("{*}dbPr")
             cs = db_pr.get("connection", "") if db_pr is not None else ""
+            cmd = db_pr.get("command", "") if db_pr is not None else ""
 
             conn_map[conn_id] = {
                 "id": conn_id,
                 "name": conn_name,
                 "type": conn_type,
                 "connection_string": cs,
+                "command": cmd,
             }
 
         return conn_map
@@ -94,7 +96,6 @@ class QueryTableExtractor(BaseExtractor):
         location = f"{sheet_ref}:QueryTable:{qt_name}" if sheet_ref else f"QueryTable:{qt_name}"
 
         # Look for SQL override in refresh
-        query_text = None
         qt_refresh = root.find(f"{{{NS}}}queryTableRefresh")
         if qt_refresh is None:
             qt_refresh = root.find("queryTableRefresh")
@@ -113,6 +114,8 @@ class QueryTableExtractor(BaseExtractor):
         raw_connection = conn_info.get("connection_string", "") or conn_info.get("name", "")
         conn_name = conn_info.get("name", qt_name)
         conn_type = conn_info.get("type", "")
+        query_text = conn_info.get("command", "") or None
+        parsed_query = parse_sql(query_text) if query_text else None
 
         # Map type to sub_type
         type_map = {
@@ -123,8 +126,6 @@ class QueryTableExtractor(BaseExtractor):
 
         if not raw_connection:
             raw_connection = qt_name
-
-        parsed_query = parse_sql(query_text) if query_text else None
 
         conn = DataConnection(
             id=DataConnection.make_id("database", raw_connection, location),

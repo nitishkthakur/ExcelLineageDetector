@@ -8,8 +8,9 @@ import re
 # '[workbook.xlsx]Sheet1'!A1
 # 'C:\path\[workbook.xlsx]Sheet1'!A1
 # '\\server\share\[workbook.xlsx]Sheet1'!A1
+# 'https://company.sharepoint.com/sites/dept/Docs/[workbook.xlsx]Sheet1'!A1
 EXTERNAL_REF_PATTERN = re.compile(
-    r"'?([A-Za-z]:\\[^'[]*|\\\\[^'[]*)?(?:\[([^\]]+\.(?:xlsx?|xlsm|xlsb|csv))\])([^'!]*)(?:')?!([A-Z$][A-Z0-9$:]*)",
+    r"'?([A-Za-z]:\\[^'[]*|\\\\[^'[]*|https?://[^'[]+)?(?:\[([^\]]+\.(?:xlsx?|xlsm|xlsb|csv))\])([^'!]*)(?:')?!([A-Z$][A-Z0-9$:]*)",
     re.IGNORECASE,
 )
 

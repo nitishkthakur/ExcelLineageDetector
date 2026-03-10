@@ -8,19 +8,27 @@ from typing import Optional
 from lineage.models import DataConnection
 
 
-# Category color coding (background fill colors)
+# Category color coding (background fill colors).
+# Add an entry here whenever a new category is introduced.
 CATEGORY_COLORS = {
     "database": "E3F2FD",
-    "file": "E8F5E9",
-    "web": "FFF3E0",
+    "file":     "E8F5E9",
+    "web":      "FFF3E0",
     "powerquery": "F3E5F5",
-    "vba": "FFEBEE",
-    "pivot": "E0F7FA",
-    "formula": "E8EAF6",
+    "vba":      "FFEBEE",
+    "pivot":    "E0F7FA",
+    "formula":  "E8EAF6",
     "hyperlink": "FFF8E1",
-    "ole": "F9FBE7",
+    "ole":      "F9FBE7",
     "metadata": "FAFAFA",
+    "input":    "FFF9C4",  # light yellow - signals manual entry
 }
+
+# Categories that have their own dedicated sheet in the report.
+# All other categories land in the "Other Sources" catch-all sheet.
+DEDICATED_SHEET_CATEGORIES = frozenset(
+    ["database", "powerquery", "file", "web", "hyperlink", "vba", "input"]
+)
 
 HEADER_FILL_COLOR = "1565C0"
 HEADER_TEXT_COLOR = "FFFFFF"
@@ -145,6 +153,23 @@ class ExcelReporter:
         vba_conns = [c for c in connections if c.category == "vba"]
         self._write_vba_sheet(ws_vba, vba_conns, style_header_row,
                               make_category_fill, make_border, auto_width)
+
+        # --- Sheet 8: Hardcoded Inputs ---
+        input_conns = [c for c in connections if c.category == "input"]
+        if input_conns:
+            ws_inputs = wb.create_sheet("Hardcoded Inputs")
+            self._write_inputs_sheet(ws_inputs, input_conns, style_header_row,
+                                     make_category_fill, make_border, auto_width)
+
+        # --- Sheet 9: Other Sources ---
+        # Catches pivot, formula, ole, metadata, and any future new categories
+        # so they are never silently missing from the report.
+        other_conns = [c for c in connections
+                       if c.category not in DEDICATED_SHEET_CATEGORIES]
+        if other_conns:
+            ws_other = wb.create_sheet("Other Sources")
+            self._write_other_sheet(ws_other, other_conns, style_header_row,
+                                    make_category_fill, make_border, auto_width)
 
         wb.save(str(out))
         return out
@@ -400,4 +425,78 @@ class ExcelReporter:
 
         ws.auto_filter.ref = f"A1:{chr(ord('A') + len(headers) - 1)}1"
         ws.column_dimensions["E"].width = 60
+        auto_width(ws)
+
+    def _write_inputs_sheet(self, ws, connections,
+                             style_header_row, make_category_fill,
+                             make_border, auto_width):
+        """Write hardcoded inputs / manual values sheet."""
+        from openpyxl.styles import Alignment
+
+        headers = ["ID", "Sub-type", "Sheet", "Cell", "Label / Name",
+                   "Value", "Value Type", "Confidence"]
+        style_header_row(ws, headers)
+        ws.freeze_panes = "A2"
+
+        fill = make_category_fill("input")
+        for i, conn in enumerate(connections, 2):
+            meta = conn.metadata or {}
+            row_data = [
+                conn.id,
+                conn.sub_type,
+                meta.get("sheet", conn.location.split("!")[0] if "!" in conn.location else ""),
+                meta.get("cell", ""),
+                meta.get("label", conn.source),
+                meta.get("value", conn.raw_connection)[:200],
+                meta.get("value_type", ""),
+                round(conn.confidence, 2),
+            ]
+            for col_idx, value in enumerate(row_data, 1):
+                cell = ws.cell(row=i, column=col_idx, value=value)
+                cell.fill = fill
+                cell.border = make_border()
+
+        ws.auto_filter.ref = f"A1:{chr(ord('A') + len(headers) - 1)}1"
+        ws.column_dimensions["E"].width = 35  # Label
+        ws.column_dimensions["F"].width = 35  # Value
+        auto_width(ws)
+
+    def _write_other_sheet(self, ws, connections,
+                            style_header_row, make_category_fill,
+                            make_border, auto_width):
+        """Catch-all sheet for pivot, ole, formula, metadata, and any future categories.
+
+        This sheet is intentionally generic so it works for every category without
+        requiring code changes when new extractors are added.
+        """
+        from openpyxl.styles import Alignment
+
+        headers = ["ID", "Category", "Sub-type", "Source", "Location",
+                   "Raw Connection", "Query / Detail", "Confidence"]
+        style_header_row(ws, headers)
+        ws.freeze_panes = "A2"
+
+        for i, conn in enumerate(connections, 2):
+            fill = make_category_fill(conn.category)
+            detail = (conn.query_text or "")[:300] if conn.query_text else ""
+            row_data = [
+                conn.id,
+                conn.category,
+                conn.sub_type,
+                conn.source,
+                conn.location,
+                conn.raw_connection[:200],
+                detail,
+                round(conn.confidence, 2),
+            ]
+            for col_idx, value in enumerate(row_data, 1):
+                cell = ws.cell(row=i, column=col_idx, value=value)
+                cell.fill = fill
+                cell.border = make_border()
+                if col_idx == 7:
+                    cell.alignment = Alignment(wrap_text=True, vertical="top")
+
+        ws.auto_filter.ref = f"A1:{chr(ord('A') + len(headers) - 1)}1"
+        ws.column_dimensions["F"].width = 40  # Raw Connection
+        ws.column_dimensions["G"].width = 50  # Query / Detail
         auto_width(ws)

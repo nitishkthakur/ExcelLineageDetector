@@ -6,6 +6,7 @@ import zipfile
 from lineage.extractors.base import BaseExtractor
 from lineage.models import DataConnection
 from lineage.parsers.connection_string import parse as parse_cs, format_source_label
+from lineage.parsers.sql_parser import parse as parse_sql
 
 
 # Connection type int to sub_type mapping per OOXML spec
@@ -131,6 +132,7 @@ class ConnectionsExtractor(BaseExtractor):
             raw_connection=raw_connection,
             location=location,
             query_text=query_text,
+            parsed_query=parse_sql(query_text) if query_text else None,
             metadata={
                 "conn_id": conn_id,
                 "conn_name": conn_name,

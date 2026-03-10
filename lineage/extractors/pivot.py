@@ -6,6 +6,7 @@ import zipfile
 
 from lineage.extractors.base import BaseExtractor
 from lineage.models import DataConnection
+from lineage.parsers.sql_parser import parse as parse_sql
 
 
 NS = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
@@ -199,6 +200,7 @@ class PivotExtractor(BaseExtractor):
                 raw_connection=connection,
                 location=location,
                 query_text=command or None,
+                parsed_query=parse_sql(command) if command else None,
                 metadata={
                     "pivot_name": pivot_name,
                     "cache_id": cache_id,

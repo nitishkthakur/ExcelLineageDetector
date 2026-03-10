@@ -56,6 +56,24 @@ def generate_test_workbook(path: Path) -> list[dict]:
     ws_hidden.sheet_state = "hidden"
     ws_hidden["A1"] = "Hidden sheet external ref placeholder"
 
+    # ── Inputs sheet: labeled hardcoded parameters (finance model inputs) ──
+    ws_inputs = wb.create_sheet("Inputs")
+    ws_inputs["A1"] = "Parameter"
+    ws_inputs["B1"] = "Value"
+    ws_inputs["C1"] = "Notes"
+    ws_inputs["A2"] = "Discount Rate"
+    ws_inputs["B2"] = 0.085          # hardcoded – no formula
+    ws_inputs["C2"] = "Source: Bloomberg as of 12/31/2024"
+    ws_inputs["A3"] = "Terminal Growth Rate"
+    ws_inputs["B3"] = 0.025          # hardcoded
+    ws_inputs["C3"] = "Per FactSet consensus estimates"
+    ws_inputs["A4"] = "Tax Rate"
+    ws_inputs["B4"] = 0.21           # hardcoded
+    ws_inputs["C4"] = "Source: Company filings 2023"
+    ws_inputs["A5"] = "Shares Outstanding (MM)"
+    ws_inputs["B5"] = 1234.5         # hardcoded
+    ws_inputs["C5"] = "Data from Reuters"
+
     # Add a comment with URL
     from openpyxl.comments import Comment
     comment = Comment(
@@ -79,7 +97,7 @@ def generate_test_workbook(path: Path) -> list[dict]:
 
     # Step 3: Inject XML modifications
 
-    # 3a. Modify Sheet1 XML to add external formula references directly
+    # 3a. Modify Sheet1 XML to add external formula references and Bloomberg formula
     sheet1_xml = zip_contents.get("xl/worksheets/sheet1.xml", b"")
     if sheet1_xml:
         sheet1_xml = _inject_external_formulas(sheet1_xml)
@@ -117,7 +135,17 @@ def generate_test_workbook(path: Path) -> list[dict]:
     custom_props_xml = _make_custom_doc_props()
     zip_contents["docProps/custom.xml"] = custom_props_xml.encode("utf-8")
 
-    # 3g. Update [Content_Types].xml to include new files
+    # 3g. Inject xl/externalLinks/ with a SharePoint URL target
+    ext_link_xml, ext_link_rels_xml = _make_external_link_xml()
+    zip_contents["xl/externalLinks/externalLink1.xml"] = ext_link_xml.encode("utf-8")
+    zip_contents["xl/externalLinks/_rels/externalLink1.xml.rels"] = ext_link_rels_xml.encode("utf-8")
+
+    # 3h. Add workbook relationship for the external link
+    wb_rels_key = "xl/_rels/workbook.xml.rels"
+    if wb_rels_key in zip_contents:
+        zip_contents[wb_rels_key] = _inject_external_link_rel(zip_contents[wb_rels_key])
+
+    # 3i. Update [Content_Types].xml to include new files
     content_types = zip_contents.get("[Content_Types].xml", b"")
     content_types = _update_content_types(content_types)
     zip_contents["[Content_Types].xml"] = content_types
@@ -205,13 +233,33 @@ def generate_test_workbook(path: Path) -> list[dict]:
             "type": "core_properties",
             "description": "Document core metadata (creator, dates)",
         },
+        {
+            "id": "hardcoded_discount_rate",
+            "type": "hardcoded_value",
+            "description": "Hardcoded Discount Rate = 0.085 in Inputs sheet",
+        },
+        {
+            "id": "source_note_bloomberg",
+            "type": "source_note",
+            "description": "Source attribution: 'Source: Bloomberg as of 12/31/2024'",
+        },
+        {
+            "id": "bloomberg_formula",
+            "type": "bloomberg",
+            "description": "Bloomberg BDP formula: =BDP(\"AAPL US Equity\",\"PX_LAST\")",
+        },
+        {
+            "id": "external_link_sharepoint",
+            "type": "sharepoint_workbook",
+            "description": "SharePoint workbook URL in xl/externalLinks/externalLink1.xml",
+        },
     ]
 
     return planted
 
 
 def _inject_external_formulas(sheet_xml: bytes) -> bytes:
-    """Inject external formula references into sheet XML."""
+    """Inject external formula references and Bloomberg formula into sheet XML."""
     xml_str = sheet_xml.decode("utf-8", errors="replace")
 
     # Find the sheetData section and add formula rows
@@ -232,6 +280,12 @@ def _inject_external_formulas(sheet_xml: bytes) -> bytes:
     <row r="12">
       <c r="A12" t="str">
         <f>WEBSERVICE("https://api.exchangerate.host/latest")</f>
+        <v></v>
+      </c>
+    </row>
+    <row r="13">
+      <c r="A13" t="str">
+        <f>BDP("AAPL US Equity","PX_LAST")</f>
         <v></v>
       </c>
     </row>
@@ -415,10 +469,63 @@ def _update_content_types(content_types: bytes) -> bytes:
             'custom-properties+xml"/>'
         )
 
+    if "externalLink" not in xml_str:
+        additions.append(
+            '<Override PartName="/xl/externalLinks/externalLink1.xml" '
+            'ContentType="application/vnd.openxmlformats-officedocument.'
+            'spreadsheetml.externalLink+xml"/>'
+        )
+
     if additions and "</Types>" in xml_str:
         xml_str = xml_str.replace(
             "</Types>",
             "\n".join(additions) + "\n</Types>"
         )
+
+    return xml_str.encode("utf-8")
+
+
+def _make_external_link_xml() -> tuple[str, str]:
+    """Create externalLink1.xml and its .rels file with a SharePoint URL target."""
+    ext_link_xml = (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n'
+        '<externalLink xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">\n'
+        '  <externalBook xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"'
+        ' r:id="rId1">\n'
+        '    <sheetNames>\n'
+        '      <sheetName val="Sheet1"/>\n'
+        '      <sheetName val="Summary"/>\n'
+        '    </sheetNames>\n'
+        '    <definedNames/>\n'
+        '    <sheetDataSet/>\n'
+        '  </externalBook>\n'
+        '</externalLink>\n'
+    )
+
+    ext_link_rels_xml = (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n'
+        '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">\n'
+        '  <Relationship Id="rId1"\n'
+        '    Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/externalLinkPath"\n'
+        '    Target="https://mycompany.sharepoint.com/sites/Finance/Shared%20Documents/budget_2024.xlsx"\n'
+        '    TargetMode="External"/>\n'
+        '</Relationships>\n'
+    )
+
+    return ext_link_xml, ext_link_rels_xml
+
+
+def _inject_external_link_rel(wb_rels: bytes) -> bytes:
+    """Add external link relationship to workbook.xml.rels."""
+    xml_str = wb_rels.decode("utf-8", errors="replace")
+
+    ext_rel = (
+        '  <Relationship Id="rId_extLink1"\n'
+        '    Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/externalLink"\n'
+        '    Target="externalLinks/externalLink1.xml"/>'
+    )
+
+    if "externalLink" not in xml_str and "</Relationships>" in xml_str:
+        xml_str = xml_str.replace("</Relationships>", ext_rel + "\n</Relationships>")
 
     return xml_str.encode("utf-8")

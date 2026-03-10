@@ -7,7 +7,7 @@ import zipfile
 
 from lineage.extractors.base import BaseExtractor
 from lineage.models import DataConnection
-from lineage.parsers.m_parser import parse as parse_m
+from lineage.parsers.m_parser import parse as parse_m, parse_all as parse_m_all
 
 
 NS = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
@@ -85,9 +85,8 @@ class PowerQueryExtractor(BaseExtractor):
                     for query in queries:
                         if not isinstance(query, dict):
                             continue
-                        conn = self._make_query_connection(query, source_name)
-                        if conn:
-                            results.append(conn)
+                        conns = self._make_query_connections(query, source_name)
+                        results.extend(conns)
             except json.JSONDecodeError:
                 pass
 
@@ -103,51 +102,74 @@ class PowerQueryExtractor(BaseExtractor):
             if len(formula) < 5:
                 continue
             name = name_matches[i] if i < len(name_matches) else f"Query_{i}"
-            parsed = parse_m(formula)
-            raw_conn = parsed.get("source", formula[:100])
-            if not raw_conn:
-                raw_conn = formula[:100]
+            all_parsed = parse_m_all(formula)
+            if not all_parsed:
+                all_parsed = [{"sub_type": "m_formula", "source": name, "details": {}}]
 
-            conn = DataConnection(
-                id=DataConnection.make_id("powerquery", formula[:50], source_name),
-                category="powerquery",
-                sub_type=parsed.get("sub_type", "m_formula"),
-                source=parsed.get("source", name) or name,
-                raw_connection=raw_conn,
-                location=source_name,
-                query_text=formula,
-                metadata={"query_name": name, "details": parsed.get("details", {})},
-            )
-            results.append(conn)
+            for j, parsed in enumerate(all_parsed):
+                raw_conn = parsed.get("source", "") or formula[:100]
+                id_key = f"{formula[:50]}:{j}" if j > 0 else formula[:50]
+                conn = DataConnection(
+                    id=DataConnection.make_id("powerquery", id_key, source_name),
+                    category="powerquery",
+                    sub_type=parsed.get("sub_type", "m_formula"),
+                    source=parsed.get("source", name) or name,
+                    raw_connection=raw_conn,
+                    location=source_name,
+                    query_text=formula if j == 0 else None,
+                    metadata={
+                        "query_name": name,
+                        "details": parsed.get("details", {}),
+                    },
+                )
+                results.append(conn)
 
         return results
 
     def _make_query_connection(self, query: dict, source_name: str) -> DataConnection | None:
-        """Create a DataConnection from a parsed Power Query query object."""
+        """Create a DataConnection from a parsed Power Query query object.
+
+        Returns the first connection; additional sources in the same M script
+        are emitted via _make_query_connections().
+        """
+        conns = self._make_query_connections(query, source_name)
+        return conns[0] if conns else None
+
+    def _make_query_connections(
+        self, query: dict, source_name: str
+    ) -> list[DataConnection]:
+        """Create DataConnection(s) from a Power Query object - one per data source."""
         formula = query.get("Formula", query.get("formula", ""))
         name = query.get("Name", query.get("name", "UnnamedQuery"))
         description = query.get("Description", "")
 
         if not formula:
-            return None
+            return []
 
-        parsed = parse_m(formula)
-        raw_conn = parsed.get("source", "") or formula[:100]
+        all_parsed = parse_m_all(formula)
+        if not all_parsed:
+            all_parsed = [{"sub_type": "m_formula", "source": name, "details": {}}]
 
-        return DataConnection(
-            id=DataConnection.make_id("powerquery", name, source_name),
-            category="powerquery",
-            sub_type=parsed.get("sub_type", "m_formula"),
-            source=parsed.get("source", name) or name,
-            raw_connection=raw_conn,
-            location=source_name,
-            query_text=formula,
-            metadata={
-                "query_name": name,
-                "description": description,
-                "details": parsed.get("details", {}),
-            },
-        )
+        results = []
+        for i, parsed in enumerate(all_parsed):
+            raw_conn = parsed.get("source", "") or formula[:100]
+            id_key = f"{name}:{i}" if i > 0 else name
+            conn = DataConnection(
+                id=DataConnection.make_id("powerquery", id_key, source_name),
+                category="powerquery",
+                sub_type=parsed.get("sub_type", "m_formula"),
+                source=parsed.get("source", name) or name,
+                raw_connection=raw_conn,
+                location=source_name,
+                query_text=formula if i == 0 else None,
+                metadata={
+                    "query_name": name,
+                    "description": description,
+                    "details": parsed.get("details", {}),
+                },
+            )
+            results.append(conn)
+        return results
 
     def _extract_from_connections(self, zip_file: zipfile.ZipFile) -> list[DataConnection]:
         """Extract Power Query embedded in connections.xml (Query - prefix pattern)."""

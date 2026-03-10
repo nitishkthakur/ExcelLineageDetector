@@ -15,6 +15,8 @@ from lineage.extractors.namedranges import NamedRangesExtractor
 from lineage.extractors.comments import CommentsExtractor
 from lineage.extractors.metadata import MetadataExtractor
 from lineage.extractors.ole import OleExtractor
+from lineage.extractors.externallinks import ExternalLinksExtractor
+from lineage.extractors.hardcoded import HardcodedValuesExtractor
 from lineage.models import DataConnection
 from lineage.utils import get_logger
 
@@ -30,6 +32,7 @@ class ExcelLineageDetector:
         ConnectionsExtractor,
         PowerQueryExtractor,
         FormulasExtractor,
+        ExternalLinksExtractor,   # xl/externalLinks/ - resolves external workbook paths/URLs
         VbaExtractor,
         PivotExtractor,
         QueryTableExtractor,
@@ -38,6 +41,7 @@ class ExcelLineageDetector:
         CommentsExtractor,
         MetadataExtractor,
         OleExtractor,
+        HardcodedValuesExtractor,
     ]
 
     def __init__(self):

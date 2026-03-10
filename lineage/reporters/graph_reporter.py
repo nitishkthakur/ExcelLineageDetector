@@ -5,7 +5,9 @@ from pathlib import Path
 
 from lineage.models import DataConnection
 
-# Color palette by category
+# Color palette by category.
+# When adding a new extractor category, add entries to all three dicts below.
+# Unknown categories fall back to DEFAULT_COLOR / DEFAULT_BG automatically.
 CATEGORY_COLORS = {
     "database":   "#1565C0",
     "powerquery": "#6A1B9A",
@@ -17,6 +19,7 @@ CATEGORY_COLORS = {
     "formula":    "#00695C",
     "metadata":   "#4E342E",
     "ole":        "#4527A0",
+    "input":      "#F57F17",   # amber/gold - signals manual data entry
 }
 CATEGORY_BG = {
     "database":   "#E3F2FD",
@@ -29,10 +32,13 @@ CATEGORY_BG = {
     "formula":    "#E0F7FA",
     "metadata":   "#EFEBE9",
     "ole":        "#EDE7F6",
+    "input":      "#FFF9C4",   # light yellow
 }
+# Controls display order in the graph (left column, top to bottom).
+# New categories not listed here are appended alphabetically at the end.
 CATEGORY_ORDER = [
     "database", "powerquery", "file", "web",
-    "hyperlink", "vba", "formula", "pivot", "metadata", "ole",
+    "hyperlink", "vba", "formula", "pivot", "metadata", "ole", "input",
 ]
 DEFAULT_COLOR = "#546E7A"
 DEFAULT_BG    = "#ECEFF1"

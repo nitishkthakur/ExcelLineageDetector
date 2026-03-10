@@ -40,6 +40,23 @@ CONN_STR_PATTERN = re.compile(
     r'(?i)(?:ConnectionString|\.Open)\s*[=\s]\s*["\']([^"\']+)["\']',
     re.IGNORECASE,
 )
+# XMLHTTPRequest / WinHttp - used for REST API calls from VBA
+XMLHTTP_PATTERN = re.compile(
+    r'(?i)(?:MSXML2\.XMLHTTP|MSXML2\.ServerXMLHTTP|WinHttp\.WinHttpRequest'
+    r'|Microsoft\.XMLHTTP|CreateObject\s*\(\s*"MSXML2\.(?:XMLHTTP|ServerXMLHTTP)[^"]*"'
+    r'|CreateObject\s*\(\s*"WinHttp\.WinHttpRequest[^"]*")',
+    re.IGNORECASE,
+)
+# .Open call on an XMLHttp/WinHttp object with method and URL
+XMLHTTP_OPEN_PATTERN = re.compile(
+    r'(?i)\.Open\s+["\'](?:GET|POST|PUT|DELETE|PATCH)["\'],\s*["\']([^"\']+)["\']',
+    re.IGNORECASE,
+)
+# GetObject() with a file path (opens a COM object from a file)
+GETOBJECT_PATTERN = re.compile(
+    r'(?i)GetObject\s*\(\s*["\']([^"\']+)["\']',
+    re.IGNORECASE,
+)
 
 
 class VbaExtractor(BaseExtractor):
@@ -277,6 +294,57 @@ class VbaExtractor(BaseExtractor):
                 location=location,
                 metadata={"module": module_name},
                 confidence=0.9,
+            )
+            results.append(conn)
+
+        # Extract XMLHTTPRequest / WinHttp HTTP calls (REST API access from VBA)
+        has_xmlhttp = bool(XMLHTTP_PATTERN.search(code))
+        if has_xmlhttp:
+            seen_http = set()
+            for match in XMLHTTP_OPEN_PATTERN.finditer(code):
+                url = match.group(1).rstrip('.,;)')
+                if url in seen_http:
+                    continue
+                seen_http.add(url)
+                line_num = code[:match.start()].count('\n') + 1
+                location = f"VBA:{module_name}:{line_num}"
+                conn = DataConnection(
+                    id=DataConnection.make_id("web", url, location),
+                    category="web",
+                    sub_type="xmlhttp_request",
+                    source=url[:100],
+                    raw_connection=url,
+                    location=location,
+                    metadata={"module": module_name, "method": "XMLHTTPRequest"},
+                    confidence=0.9,
+                )
+                results.append(conn)
+
+        # Extract GetObject() file references
+        seen_getobj = set()
+        for match in GETOBJECT_PATTERN.finditer(code):
+            path = match.group(1)
+            if path in seen_getobj or len(path) < 3:
+                continue
+            seen_getobj.add(path)
+            line_num = code[:match.start()].count('\n') + 1
+            location = f"VBA:{module_name}:{line_num}"
+            # Determine if URL or file path
+            if path.startswith("http://") or path.startswith("https://"):
+                cat, stype = "web", "url"
+            elif path.startswith("\\\\"):
+                cat, stype = "file", "unc_path"
+            else:
+                cat, stype = "file", "local_file"
+            conn = DataConnection(
+                id=DataConnection.make_id(cat, path, location),
+                category=cat,
+                sub_type=stype,
+                source=path,
+                raw_connection=path,
+                location=location,
+                metadata={"module": module_name, "via": "GetObject"},
+                confidence=0.85,
             )
             results.append(conn)
 

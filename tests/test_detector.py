@@ -233,3 +233,131 @@ def test_parsers_formula():
     result = parse(formula)
     assert result is not None
     assert result.get("workbook_name") == "source_data.xlsx"
+
+
+def test_hardcoded_detection():
+    """Test that hardcoded values in the Inputs sheet are detected as 'input' category."""
+    FIXTURE_DIR.mkdir(exist_ok=True)
+    test_file = FIXTURE_DIR / "test_connections.xlsx"
+    if not test_file.exists():
+        generate_test_workbook(test_file)
+
+    detector = ExcelLineageDetector()
+    connections = detector.detect(test_file)
+
+    input_conns = [c for c in connections if c.category == "input"]
+    assert len(input_conns) > 0, "Expected at least one 'input' category connection"
+
+    # Verify sheet metadata is present
+    for conn in input_conns:
+        assert "sheet" in conn.metadata, f"input connection missing 'sheet' in metadata: {conn}"
+        assert conn.metadata["sheet"], f"input connection has empty 'sheet' in metadata: {conn}"
+
+
+def test_source_note_detection():
+    """Test that source attribution text cells are detected as 'source_note'."""
+    FIXTURE_DIR.mkdir(exist_ok=True)
+    test_file = FIXTURE_DIR / "test_connections.xlsx"
+    if not test_file.exists():
+        generate_test_workbook(test_file)
+
+    detector = ExcelLineageDetector()
+    connections = detector.detect(test_file)
+
+    source_notes = [c for c in connections if c.sub_type == "source_note"]
+    assert len(source_notes) > 0, (
+        "Expected at least one 'source_note' connection from 'Source: Bloomberg' text"
+    )
+
+
+def test_bloomberg_formula_detection():
+    """Test that Bloomberg BDP/BDH formulas are detected."""
+    FIXTURE_DIR.mkdir(exist_ok=True)
+    test_file = FIXTURE_DIR / "test_connections.xlsx"
+    if not test_file.exists():
+        generate_test_workbook(test_file)
+
+    detector = ExcelLineageDetector()
+    connections = detector.detect(test_file)
+
+    bloomberg_conns = [c for c in connections if c.sub_type == "bloomberg"]
+    assert len(bloomberg_conns) > 0, (
+        "Expected at least one 'bloomberg' sub_type connection from BDP formula"
+    )
+
+
+def test_external_link_sharepoint():
+    """Test that SharePoint URLs in xl/externalLinks/ are detected."""
+    FIXTURE_DIR.mkdir(exist_ok=True)
+    test_file = FIXTURE_DIR / "test_connections.xlsx"
+    if not test_file.exists():
+        generate_test_workbook(test_file)
+
+    detector = ExcelLineageDetector()
+    connections = detector.detect(test_file)
+
+    sp_conns = [c for c in connections if c.sub_type == "sharepoint_workbook"]
+    assert len(sp_conns) > 0, (
+        "Expected at least one 'sharepoint_workbook' connection from xl/externalLinks/"
+    )
+    assert any("sharepoint.com" in c.raw_connection.lower() for c in sp_conns), (
+        "SharePoint connection raw_connection should contain 'sharepoint.com'"
+    )
+
+
+def test_sql_parsed_tables():
+    """Test that SQL command text in connections.xml has tables extracted."""
+    FIXTURE_DIR.mkdir(exist_ok=True)
+    test_file = FIXTURE_DIR / "test_connections.xlsx"
+    if not test_file.exists():
+        generate_test_workbook(test_file)
+
+    detector = ExcelLineageDetector()
+    connections = detector.detect(test_file)
+
+    db_conns = [c for c in connections if c.category == "database" and c.parsed_query is not None]
+    assert len(db_conns) > 0, (
+        "Expected at least one database connection with parsed_query"
+    )
+    tables_found = [c for c in db_conns if c.parsed_query and c.parsed_query.tables]
+    assert len(tables_found) > 0, (
+        "Expected at least one database connection with tables in parsed_query"
+    )
+
+
+def test_excel_report_has_hardcoded_sheet():
+    """Test that the Excel report includes a 'Hardcoded Inputs' sheet when inputs exist."""
+    import tempfile
+    import openpyxl
+
+    FIXTURE_DIR.mkdir(exist_ok=True)
+    test_file = FIXTURE_DIR / "test_connections.xlsx"
+    if not test_file.exists():
+        generate_test_workbook(test_file)
+
+    detector = ExcelLineageDetector()
+    connections = detector.detect(test_file)
+
+    input_conns = [c for c in connections if c.category == "input"]
+    if not input_conns:
+        pytest.skip("No input connections found; skipping hardcoded sheet test")
+
+    from lineage.reporters.excel_reporter import ExcelReporter
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        out_dir = Path(tmpdir)
+        out_path = ExcelReporter().write(connections, test_file, out_dir)
+        assert out_path.exists()
+
+        report_wb = openpyxl.load_workbook(str(out_path))
+        sheet_names = report_wb.sheetnames
+        assert "Hardcoded Inputs" in sheet_names, (
+            f"Expected 'Hardcoded Inputs' sheet in report, got: {sheet_names}"
+        )
+
+        # Verify the sheet has a 'Sheet' column header
+        ws = report_wb["Hardcoded Inputs"]
+        headers = [ws.cell(row=1, column=i).value for i in range(1, 10)]
+        assert "Sheet" in headers, (
+            f"Expected 'Sheet' column in Hardcoded Inputs sheet, got: {headers}"
+        )
