@@ -18,6 +18,10 @@ Always use the project venv at `.venv/`:
 
 # JSON output only (skips Excel report and PNG graph)
 .venv/bin/python detect_lineage.py path/to/file.xlsx --json-only --out-dir ./out
+
+# Upstream tracing — trace hardcoded vectors back to source files
+.venv/bin/python trace_upstream.py model.xlsx --sheet "Sheet1" --upstream-dir ./sources/
+.venv/bin/python trace_upstream.py model.xlsx --list-sheets
 ```
 
 ## Architecture
@@ -49,7 +53,7 @@ Each extractor in `lineage/extractors/` handles one ZIP region. Never raise exce
    - Add a color entry to `CATEGORY_COLORS` in `lineage/reporters/excel_reporter.py`
    - Add color entries to `CATEGORY_COLORS` and `CATEGORY_BG` in `lineage/reporters/graph_reporter.py`
    - Add the category name to `CATEGORY_ORDER` in `graph_reporter.py`
-   - If it needs a dedicated Excel sheet, add a `_write_*_sheet` method and register it in `write()` and add the category to `DEDICATED_SHEET_CATEGORIES`; otherwise it auto-appears in the "Other Sources" sheet
+   - The Excel reporter no longer has dedicated per-category sheets; all connections go to "All Connections". No reporter changes needed for new categories (CATEGORY_COLORS still applies for row colour coding)
 4. JSON output is fully automatic — no changes needed
 
 | Extractor | ZIP path(s) it reads |
@@ -81,7 +85,9 @@ Each extractor in `lineage/extractors/` handles one ZIP region. Never raise exce
 
 **Power Query multi-source queries**: A single M script can join multiple databases/files. `PowerQueryExtractor` calls `parse_m_all()` and emits one `DataConnection` per source found in the script.
 
-**Hardcoded / copy-pasted values (`input` category)**: `HardcodedValuesExtractor` detects cells that have a value but no formula. It reports them at four confidence levels — `named_input` (named range → single cell, conf 0.95), `hardcoded_value` (labeled row in an Inputs/Assumptions sheet, conf 0.7–0.9), `pasted_table` (contiguous 2×2+ numeric block with ≥2 column headers, conf 0.75), and `source_note` (text cell matching "Source: Bloomberg", "Per FactSet", etc., conf 0.7). Cells with no label context are skipped to suppress noise. The Excel report writes these to a dedicated "Hardcoded Inputs" sheet with a **Sheet** column indicating which worksheet they came from.
+**Hardcoded / copy-pasted values (`input` category)**: `HardcodedValuesExtractor` detects cells that have a value but no formula. It reports them at four confidence levels — `named_input` (named range → single cell, conf 0.95), `hardcoded_value` (labeled row in an Inputs/Assumptions sheet, conf 0.7–0.9), `pasted_table` (contiguous 2×2+ numeric block with ≥2 column headers, conf 0.75), and `source_note` (text cell matching "Source: Bloomberg", "Per FactSet", etc., conf 0.7). Cells with no label context are skipped to suppress noise.
+
+**Hardcoded vector scanner** (`lineage/hardcoded_scanner.py`): Fast standalone scanner (separate from the extractor pipeline) used by `ExcelReporter` to detect **vectors** — contiguous runs of hardcoded (non-formula) numeric cells in a single row or column (minimum length 3). Uses `lxml.etree.iterparse` for O(n) streaming with constant memory — suitable for very large files. Key API: `scan_vectors(path) -> dict[sheet_name, list[HardcodedVector]]`. Returns `{}` for XLS (binary) files. Each `HardcodedVector` has `cell_range`, `direction` ("row"/"column"), `length`, `start_cell`, `end_cell`, `sample_values` (first 5).
 
 **Finance terminal formulas**: `FormulasExtractor` detects proprietary add-in functions that pull live data: Bloomberg (`BDP`, `BDH`, `BDS`, `BQL`), Reuters/Refinitiv (`RHistory`, `RData`, `TR.*`), FactSet (`FDS`, `FQL`), Capital IQ (`CIQ`, `CIQCONTENT`), SNL (`SNLD`, `SNLC`), and Wind Info (`WSD`, `WSS`). Sub-types match the terminal name (e.g. `bloomberg`, `reuters`, `factset`).
 
@@ -95,6 +101,51 @@ Each extractor in `lineage/extractors/` handles one ZIP region. Never raise exce
 .venv/bin/python tests/test_generator.py
 ```
 
-There are 19 tests in `test_detector.py` covering: coverage rate, required fields, deduplication, serialisation, all three reporters (JSON/Excel/PNG), all four parsers, and specific assertions for hardcoded values, source notes, Bloomberg formulas, SharePoint external links, SQL table extraction, and the "Hardcoded Inputs" Excel sheet.
+There are 19 tests in `test_detector.py` covering: coverage rate, required fields, deduplication, serialisation, all three reporters (JSON/Excel/PNG), all four parsers, and specific assertions for hardcoded values, source notes, Bloomberg formulas, SharePoint external links, SQL table extraction, and the Excel report structure (All Connections + per-sheet vector sheets).
 
 **When adding a new planted connection type** to the generator: add it to the `planted` list at the bottom of `generate_test_workbook()`, inject its XML/data in one of the `Step 3` blocks, and add a focused test function in `test_detector.py`.
+
+## Upstream Tracing (`lineage/tracing/`)
+
+A separate tool (`trace_upstream.py`) that identifies where hardcoded vectors in a model file were originally copy-pasted from, by matching against a set of upstream Excel files. See `upstream_algorithm.md` for the full algorithm description.
+
+**Data flow:**
+```
+trace_upstream.py (CLI)
+  → TraceConfig                        # lineage/tracing/config.py
+  → UpstreamTracer.trace()             # lineage/tracing/tracer.py
+      → scan_model_sheet()             # lineage/tracing/scanner.py (hardcoded only)
+      → scan_upstream_file() × N       # parallel, ALL numerics (formula + hardcoded)
+      → ExactMatcher.match()           # lineage/tracing/exact_matcher.py
+      → ApproximateMatcher.match()     # lineage/tracing/approx_matcher.py
+  → TracingReporter.write()            # lineage/tracing/report.py
+```
+
+**Key modules:**
+
+| Module | Purpose |
+|--------|---------|
+| `config.py` | `TraceConfig` dataclass + JSON/YAML loader |
+| `models.py` | `TracingVector` (full values), `VectorMatch` (result) |
+| `scanner.py` | Streaming XML parsers: `_stream_all_numerics` (upstream) and `_stream_hardcoded_numerics` (model). Reuses helpers from `hardcoded_scanner.py`. |
+| `exact_matcher.py` | Hash-based O(1) lookup + batched numpy subsequence matching |
+| `approx_matcher.py` | Vectorized numpy similarity (Pearson/cosine/Euclidean) with sliding window |
+| `tracer.py` | Orchestrator: parallel scanning, match coordination, result assembly |
+| `report.py` | Excel report writer: Config sheet + Tracing Results sheet |
+
+**Configuration** (`tracing_config.json`):
+- `matching.exact` / `matching.approximate` — enable/disable match modes
+- `matching.top_n` — top-N approximate matches per vector (default 5)
+- `matching.similarity_metric` — `pearson` (default), `cosine`, or `euclidean`
+- `matching.min_similarity` — minimum similarity threshold (default 0.8)
+- `matching.subsequence_matching` — match model as subsequence of longer upstream vector
+- `matching.length_tolerance_pct` — allow ±N% length mismatch for approximate (default 50%)
+- `matching.direction_sensitive` — if false (default), column↔row matching allowed
+- `performance.max_workers` — null = auto (cpu_count)
+
+**Performance design:**
+- Upstream files scanned with `ProcessPoolExecutor` (parallel I/O + XML parsing)
+- All numpy arrays pre-stacked during `index_upstream()` — one matrix per length bucket
+- Exact: batched `sliding_window_view` on 2D arrays + vectorized `==` comparison
+- Approximate: single matrix multiply per length bucket (batch Pearson correlation)
+- Benchmark: 91 model vectors × 3196 upstream vectors = **~0.9s total** (including scan + match + report)

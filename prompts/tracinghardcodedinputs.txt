@@ -1,0 +1,15 @@
+<goal>
+To trace the original location (workbook, sheet, cellranges) of hardcoded vectors in one model excel file given a list of potential input files.
+</goal>
+
+<context>
+In the model excel file (this is the file that the user passes), will be hardcoded values, vectors - which are already detected and reported by the existing code. The next job is to identify using matching (approximate or exact), which upstream excel file, sheet, cellrange was used to manually copy and paste those values in the current model file. This copying was dont by analysts and we need to identify the raw source as accurately as possible. If the exact match (vector) is not found, then, we need to resort to approximate matching strategies.
+1. For each hardcoded value in the model excel file, top_n_match candidates need to be identified in descending order of matching_score
+2. These matches of the hardcoded values need to reported out in a new excel report called upstream_tracing_<filename>.xlsx. 
+3. The code must work on one sheet of the model file - and the upstream tracing must be for that sheet alone. 
+4. Exact matches must be similarity of 1 and nearest neighbour matches can also be done.
+5. Create a config file which will contain if we are looking for exact_matches or nearest negihbour matches or both. If the user selects only exact match, then top_n_match must be ignored. top_n_match applies to when the user has selected nearest_neighbours also. 
+6. Default: Enable both top_n_matches (number of top matches in the nearest neighbour also to show - not including any results from exact matches).
+</context>
+
+

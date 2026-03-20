@@ -325,8 +325,8 @@ def test_sql_parsed_tables():
     )
 
 
-def test_excel_report_has_hardcoded_sheet():
-    """Test that the Excel report includes a 'Hardcoded Inputs' sheet when inputs exist."""
+def test_excel_report_structure():
+    """Test that the Excel report has 'All Connections' + per-sheet vector sheets."""
     import tempfile
     import openpyxl
 
@@ -338,10 +338,6 @@ def test_excel_report_has_hardcoded_sheet():
     detector = ExcelLineageDetector()
     connections = detector.detect(test_file)
 
-    input_conns = [c for c in connections if c.category == "input"]
-    if not input_conns:
-        pytest.skip("No input connections found; skipping hardcoded sheet test")
-
     from lineage.reporters.excel_reporter import ExcelReporter
 
     with tempfile.TemporaryDirectory() as tmpdir:
@@ -351,13 +347,43 @@ def test_excel_report_has_hardcoded_sheet():
 
         report_wb = openpyxl.load_workbook(str(out_path))
         sheet_names = report_wb.sheetnames
-        assert "Hardcoded Inputs" in sheet_names, (
-            f"Expected 'Hardcoded Inputs' sheet in report, got: {sheet_names}"
+
+        # Must have All Connections as the first sheet
+        assert "All Connections" in sheet_names, (
+            f"Expected 'All Connections' sheet, got: {sheet_names}"
+        )
+        assert sheet_names[0] == "All Connections", (
+            f"'All Connections' should be first, got: {sheet_names}"
         )
 
-        # Verify the sheet has a 'Sheet' column header
-        ws = report_wb["Hardcoded Inputs"]
-        headers = [ws.cell(row=1, column=i).value for i in range(1, 10)]
-        assert "Sheet" in headers, (
-            f"Expected 'Sheet' column in Hardcoded Inputs sheet, got: {headers}"
+        # Must have per-sheet vector sheets (fixture has Sheet1, HiddenData, Inputs)
+        assert len(sheet_names) >= 2, (
+            f"Expected All Connections + at least one vector sheet, got: {sheet_names}"
+        )
+
+        # The Inputs sheet should appear (fixture has an 'Inputs' sheet)
+        assert "Inputs" in sheet_names, (
+            f"Expected per-sheet vector sheet named 'Inputs', got: {sheet_names}"
+        )
+
+        # Inputs vector sheet must have correct column headers at row 3
+        ws_inputs = report_wb["Inputs"]
+        headers = [ws_inputs.cell(row=3, column=i).value for i in range(1, 8)]
+        assert "Cell Range" in headers, (
+            f"Expected 'Cell Range' in Inputs vector sheet headers (row 3): {headers}"
+        )
+        assert "Length" in headers, (
+            f"Expected 'Length' in Inputs vector sheet headers (row 3): {headers}"
+        )
+        assert "Direction" in headers, (
+            f"Expected 'Direction' in Inputs vector sheet headers (row 3): {headers}"
+        )
+
+        # Inputs sheet should have at least one vector (B2:B5 = 4 hardcoded numerics)
+        data_ranges = [
+            ws_inputs.cell(row=r, column=2).value
+            for r in range(4, ws_inputs.max_row + 1)
+        ]
+        assert any(data_ranges), (
+            "Expected at least one hardcoded vector row in the Inputs vector sheet"
         )

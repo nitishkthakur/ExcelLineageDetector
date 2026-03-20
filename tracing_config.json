@@ -1,0 +1,17 @@
+{
+  "matching": {
+    "exact": true,
+    "approximate": true,
+    "top_n": 5,
+    "exact_decimal_places": 8,
+    "subsequence_matching": true,
+    "similarity_metric": "pearson",
+    "min_similarity": 0.8,
+    "length_tolerance_pct": 50.0,
+    "direction_sensitive": false
+  },
+  "performance": {
+    "max_workers": null,
+    "min_vector_length": 3
+  }
+}

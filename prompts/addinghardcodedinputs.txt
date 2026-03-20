@@ -1,0 +1,6 @@
+Ok. I now want one addition to this. First, retain the All Connections sheet in the output. Remove all other sheets from the excel artifact. Second, One possible source of inputs is now also going to be hardcoded values. For example, the origin
+  is an analyst pasting values(not formulas) from an external excel file. So, there might be numerical values which come from an upstream excel file which are pasted. Here is what you must do now. Use a fast but accurate and complete approach
+  (pandas/polars/calamine) to read and identify any vector (continuous range of hardcoded values), identify its sheet, its range. When you report these, add an extra column which shows the cell range, sheet name, and the length of the sequence.
+  Do this sheetwise - so, add one sheet to the report per sheet in te original file for the hardcoded values as there might be many. So if the original file has 10 sheets, the report must have 11 sheets: The All Connections sheet from before and
+  10 sheets - one per sheet of hardcoded values. Remember the priority to use this on extremely large files and hence, the approach needs to be very fast - as fast as possible. Also, if vectors of hardcoded values exist, detecting and documenting
+  them is mandatory. Implement this and update claude.md. Test it out thoroughly.  
