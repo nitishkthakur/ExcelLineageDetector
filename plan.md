@@ -118,6 +118,7 @@ lineage/
     connections.py         ← xl/connections.xml
     powerquery.py          ← Power Query M code
     formulas.py            ← Cell formula external refs
+    externallinks.py       ← xl/externalLinks/ (resolves paths/URLs)
     vba.py                 ← olevba VBA extraction
     pivot.py               ← Pivot tables & cache
     querytable.py          ← Query tables
@@ -126,6 +127,7 @@ lineage/
     comments.py            ← Comments / notes
     metadata.py            ← docProps/*
     ole.py                 ← Linked OLE objects
+    hardcoded_values.py    ← Cells with value but no formula
 
   parsers/
     sql_parser.py          ← sqlglot: extract tables, columns, joins, filters
@@ -138,9 +140,25 @@ lineage/
     excel_reporter.py      ← formatted Excel workbook (openpyxl)
     graph_reporter.py      ← networkx + matplotlib PNG
 
+  hardcoded_scanner.py     ← fast streaming vector scanner (lxml iterparse)
+
+  tracing/                 ← upstream tracing module
+    config.py              ← TraceConfig dataclass + JSON/YAML loader
+    models.py              ← TracingVector, VectorMatch dataclasses
+    scanner.py             ← streaming XML parsers (model + upstream)
+    exact_matcher.py       ← hash-based lookup + batched numpy subsequence
+    approx_matcher.py      ← vectorized similarity (Pearson/cosine/Euclidean)
+    tracer.py              ← orchestrator with parallel upstream scanning
+    formula_tracer.py      ← recursive external formula reference tracing
+    report.py              ← Excel report: Config + Tracing Results + Level N sheets
+
+trace_upstream.py          ← CLI entry point for upstream tracing
+tracing_config.json        ← default config for upstream tracing
+
 tests/
   test_generator.py        ← programmatically build tricky Excel test files
-  test_detector.py         ← run detector on generated files, compute coverage score
+  test_detector.py         ← 19 tests: detection coverage and all reporters
+  test_tracing.py          ← 34 tests: upstream tracing and formula tracing
   fixtures/                ← generated .xlsx test files (gitignored)
 ```
 
@@ -204,14 +222,9 @@ Fallback to regex if sqlglot fails to parse.
 }
 ```
 
-### Excel Report (`{filename}_lineage.xlsx`)
-Sheet 1 — **Summary**: stats table + category breakdown chart
-Sheet 2 — **All Connections**: full table with auto-filters, frozen headers, color-coded rows by category
-Sheet 3 — **Databases**: only DB connections, with parsed SQL tables/columns
-Sheet 4 — **Power Query**: M code with syntax-ish highlighting
-Sheet 5 — **Files**: file path references
-Sheet 6 — **Web/API**: URLs and web connections
-Sheet 7 — **VBA**: VBA-discovered connections with source snippets
+### Excel Report (`{filename}_lineage_report.xlsx`)
+Sheet 1 — **All Connections**: full table with auto-filters, frozen headers, color-coded rows by category
+Sheets 2-N — **Per-sheet hardcoded vector sheets**: one sheet per original workbook sheet showing hardcoded numeric vectors (column/row direction, cell range, length, sample values)
 
 ### Graph (`{filename}_lineage.png`)
 - **Layout**: left-to-right hierarchical (sources → center node = target file)
@@ -261,7 +274,7 @@ Programmatically create `test_connections.xlsx` with planted connections:
 ```
 coverage_score = len(found_ids & planted_ids) / len(planted_ids) * 100
 ```
-Tests pass if score ≥ 80%. Prints per-type breakdown.
+Tests pass if score ≥ 60%. Current coverage: **100%**. Prints per-type breakdown.
 
 ---
 
@@ -321,14 +334,16 @@ file_lineage.png
 | `lineage/detector.py` | Orchestrator |
 | `lineage/models.py` | Data classes |
 | `lineage/utils.py` | Shared helpers |
-| `lineage/extractors/*.py` | 11 extractor modules |
+| `lineage/extractors/*.py` | 13 extractor modules |
 | `lineage/parsers/*.py` | 4 parser modules |
 | `lineage/reporters/*.py` | 3 reporter modules |
 | `tests/test_generator.py` | Builds test Excel files |
-| `tests/test_detector.py` | Validates coverage score |
+| `tests/test_detector.py` | 19 tests — validates detection coverage and reporters |
+| `tests/test_tracing.py` | 34 tests — upstream tracing and formula tracing |
+| `trace_upstream.py` | CLI for upstream tracing |
+| `tracing_config.json` | Default upstream tracing config |
+| `lineage/tracing/*.py` | 8 tracing modules |
 | `requirements.txt` | Dependencies |
-
-~20 files total, ~1800–2500 lines of code.
 
 ---
 

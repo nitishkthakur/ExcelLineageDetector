@@ -1,8 +1,11 @@
 """Tests for the upstream tracing module."""
 from __future__ import annotations
 
+import io
 import json
+import re
 import tempfile
+import zipfile
 from pathlib import Path
 
 import numpy as np
@@ -421,3 +424,789 @@ def test_tracer_report():
         wb = openpyxl.load_workbook(str(out_path))
         assert "Config" in wb.sheetnames
         assert "Tracing Results" in wb.sheetnames
+
+
+# ---------------------------------------------------------------------------
+# Formula tracer — helpers
+# ---------------------------------------------------------------------------
+
+def _make_xlsx_with_external_formulas(path: Path, formulas: dict[str, dict[str, str]]):
+    """Create a minimal .xlsx with external formulas injected at specific cells.
+
+    formulas: {sheet_name: {cell_ref: formula_text}}
+    """
+    import openpyxl
+    wb = openpyxl.Workbook()
+    wb.remove(wb.active)
+    for sheet_name in formulas:
+        wb.create_sheet(sheet_name)
+    wb.save(str(path))
+
+    # Now re-open the ZIP and inject <f> elements into the sheet XML
+    with zipfile.ZipFile(path, "r") as zf:
+        names = zf.namelist()
+        contents = {n: zf.read(n) for n in names}
+
+    # Read workbook.xml to find sheet rId → sheet path
+    from lxml import etree
+    wb_xml = etree.fromstring(contents["xl/workbook.xml"])
+    ns_main = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
+    ns_r = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
+
+    rels_xml = etree.fromstring(contents["xl/_rels/workbook.xml.rels"])
+    rid_to_path = {}
+    for rel in rels_xml:
+        rid = rel.get("Id", "")
+        target = rel.get("Target", "").lstrip("/")
+        # Target may be "worksheets/sheet1.xml" or "xl/worksheets/sheet1.xml"
+        if "worksheets/" in target:
+            if target.startswith("xl/"):
+                rid_to_path[rid] = target
+            else:
+                rid_to_path[rid] = "xl/" + target
+
+    sheet_name_to_path = {}
+    for el in wb_xml.iter(f"{{{ns_main}}}sheet"):
+        sname = el.get("name")
+        rid = el.get(f"{{{ns_r}}}id")
+        if rid in rid_to_path:
+            sheet_name_to_path[sname] = rid_to_path[rid]
+
+    # For each sheet, inject formulas
+    for sheet_name, cell_formulas in formulas.items():
+        sheet_path = sheet_name_to_path.get(sheet_name)
+        if not sheet_path:
+            continue
+
+        root = etree.fromstring(contents[sheet_path])
+        ns = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
+
+        # Find or create sheetData
+        sheet_data = root.find(f"{{{ns}}}sheetData")
+        if sheet_data is None:
+            sheet_data = etree.SubElement(root, f"{{{ns}}}sheetData")
+
+        for cell_ref, formula_text in cell_formulas.items():
+            # Parse cell ref
+            m = re.match(r"([A-Z]+)(\d+)", cell_ref)
+            row_num = int(m.group(2))
+            col_letters = m.group(1)
+
+            # Find or create the row
+            row_el = None
+            for r in sheet_data.findall(f"{{{ns}}}row"):
+                if r.get("r") == str(row_num):
+                    row_el = r
+                    break
+            if row_el is None:
+                row_el = etree.SubElement(sheet_data, f"{{{ns}}}row")
+                row_el.set("r", str(row_num))
+
+            # Create the cell with formula
+            c_el = etree.SubElement(row_el, f"{{{ns}}}c")
+            c_el.set("r", cell_ref)
+            f_el = etree.SubElement(c_el, f"{{{ns}}}f")
+            f_el.text = formula_text
+            v_el = etree.SubElement(c_el, f"{{{ns}}}v")
+            v_el.text = "0"
+
+        contents[sheet_path] = etree.tostring(root, xml_declaration=True, encoding="UTF-8")
+
+    # Rewrite the ZIP
+    with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as zf:
+        for name, data in contents.items():
+            zf.writestr(name, data)
+
+
+# ---------------------------------------------------------------------------
+# Formula tracer — unit tests
+# ---------------------------------------------------------------------------
+
+def test_parse_range():
+    """_parse_range handles single cells and ranges."""
+    from lineage.tracing.formula_tracer import _parse_range
+
+    assert _parse_range("A1") == (1, 1, 1, 1)
+    assert _parse_range("B3:D10") == (3, 10, 2, 4)
+    assert _parse_range("$C$5:$E$8") == (5, 8, 3, 5)
+
+
+def test_extract_filename():
+    """_extract_filename handles paths, URLs, and SharePoint URIs."""
+    from lineage.tracing.formula_tracer import _extract_filename
+
+    assert _extract_filename("budget.xlsx") == "budget.xlsx"
+    assert _extract_filename("C:\\Users\\data\\budget.xlsx") == "budget.xlsx"
+    assert _extract_filename("/Users/data/budget.xlsx") == "budget.xlsx"
+    assert _extract_filename(
+        "https://company.sharepoint.com/sites/team/Shared%20Documents/budget.xlsx"
+    ) == "budget.xlsx"
+    assert _extract_filename("file:///C:/Users/data/budget.xlsx") == "budget.xlsx"
+
+
+def test_cell_filter():
+    """CellFilter correctly filters cells by sheet and rectangle."""
+    from lineage.tracing.formula_tracer import CellFilter
+
+    cf = CellFilter.from_refs([("Sheet1", "A1:C5"), ("Sheet2", "B2:B10")])
+
+    assert cf.has_sheet("Sheet1")
+    assert cf.has_sheet("Sheet2")
+    assert not cf.has_sheet("Sheet3")
+
+    assert cf.contains("Sheet1", 1, 1)   # A1
+    assert cf.contains("Sheet1", 5, 3)   # C5
+    assert not cf.contains("Sheet1", 6, 1)  # A6 — outside
+    assert cf.contains("Sheet2", 5, 2)   # B5
+    assert not cf.contains("Sheet2", 1, 2)  # B1 — outside
+
+
+def test_parse_formula_refs_literal():
+    """_parse_formula_refs handles literal [file.xlsx]Sheet!Range."""
+    from lineage.tracing.formula_tracer import _parse_formula_refs
+
+    formula = "'[budget.xlsx]Revenue'!A1:A10"
+    refs = _parse_formula_refs(formula, {})
+    assert len(refs) == 1
+    assert refs[0][0] == "budget.xlsx"
+    assert refs[0][1] == "Revenue"
+    assert refs[0][2] == "A1:A10"
+
+
+def test_parse_formula_refs_numeric_index():
+    """_parse_formula_refs resolves numeric [1] via link_map."""
+    from lineage.tracing.formula_tracer import _parse_formula_refs
+
+    link_map = {"1": ("source.xlsx", "/path/to/source.xlsx")}
+    formula = "[1]Data!B5"
+    refs = _parse_formula_refs(formula, link_map)
+    assert len(refs) == 1
+    assert refs[0][0] == "source.xlsx"
+    assert refs[0][1] == "Data"
+    assert refs[0][2] == "B5"
+
+
+def test_parse_formula_refs_sharepoint():
+    """_parse_formula_refs handles SharePoint URL paths."""
+    from lineage.tracing.formula_tracer import _parse_formula_refs
+
+    formula = "'https://company.sharepoint.com/sites/team/Shared Documents/[data.xlsx]Sheet1'!C3:C20"
+    refs = _parse_formula_refs(formula, {})
+    assert len(refs) == 1
+    assert refs[0][0] == "data.xlsx"
+    assert refs[0][1] == "Sheet1"
+    assert refs[0][2] == "C3:C20"
+
+
+def test_parse_formula_refs_multiple():
+    """_parse_formula_refs returns all refs from a complex formula."""
+    from lineage.tracing.formula_tracer import _parse_formula_refs
+
+    formula = "'[a.xlsx]S1'!A1+'[b.xlsx]S2'!B2"
+    refs = _parse_formula_refs(formula, {})
+    assert len(refs) == 2
+    filenames = {r[0] for r in refs}
+    assert filenames == {"a.xlsx", "b.xlsx"}
+
+
+def test_resolve_file_found(tmp_path):
+    """_resolve_file finds an existing file."""
+    from lineage.tracing.formula_tracer import _resolve_file
+
+    (tmp_path / "budget.xlsx").write_bytes(b"fake")
+    path, found = _resolve_file("budget.xlsx", [tmp_path])
+    assert found is True
+    assert path.name == "budget.xlsx"
+
+
+def test_resolve_file_case_insensitive(tmp_path):
+    """_resolve_file falls back to case-insensitive search."""
+    from lineage.tracing.formula_tracer import _resolve_file
+
+    (tmp_path / "Budget.xlsx").write_bytes(b"fake")
+    path, found = _resolve_file("budget.xlsx", [tmp_path])
+    assert found is True
+    assert path.name == "Budget.xlsx"
+
+
+def test_resolve_file_not_found(tmp_path):
+    """_resolve_file returns (expected_path, False) for missing files."""
+    from lineage.tracing.formula_tracer import _resolve_file
+
+    path, found = _resolve_file("nonexistent.xlsx", [tmp_path])
+    assert found is False
+    assert path.name == "nonexistent.xlsx"
+
+
+def test_stream_external_formulas():
+    """_stream_external_formulas finds formulas with [ in them."""
+    from lineage.tracing.formula_tracer import _stream_external_formulas
+
+    # Build minimal sheet XML
+    xml = b'''<?xml version="1.0" encoding="UTF-8"?>
+    <worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
+    <sheetData>
+      <row r="1">
+        <c r="A1"><f>'[data.xlsx]Sheet1'!A1</f><v>100</v></c>
+        <c r="B1"><f>SUM(A1:A5)</f><v>500</v></c>
+        <c r="C1"><v>42</v></c>
+      </row>
+    </sheetData>
+    </worksheet>'''
+
+    results = _stream_external_formulas(xml, "Sheet1")
+    assert len(results) == 1
+    assert results[0][0] == "A1"
+    assert "[data.xlsx]" in results[0][1]
+
+
+def test_stream_external_formulas_with_filter():
+    """_stream_external_formulas respects cell_filter."""
+    from lineage.tracing.formula_tracer import _stream_external_formulas, CellFilter
+
+    xml = b'''<?xml version="1.0" encoding="UTF-8"?>
+    <worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
+    <sheetData>
+      <row r="1">
+        <c r="A1"><f>'[data.xlsx]Sheet1'!A1</f><v>100</v></c>
+      </row>
+      <row r="10">
+        <c r="A10"><f>'[other.xlsx]Sheet2'!B5</f><v>200</v></c>
+      </row>
+    </sheetData>
+    </worksheet>'''
+
+    # Filter only row 10
+    cf = CellFilter.from_refs([("Sheet1", "A10:A10")])
+    results = _stream_external_formulas(xml, "Sheet1", cf)
+    assert len(results) == 1
+    assert results[0][0] == "A10"
+
+
+def test_scan_external_refs_on_generated_file():
+    """scan_external_refs finds injected external formulas in an xlsx."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmp = Path(tmpdir)
+        test_file = tmp / "model.xlsx"
+        _make_xlsx_with_external_formulas(test_file, {
+            "Sheet1": {
+                "A1": "'[upstream.xlsx]Data'!A1:A10",
+                "B1": "'[source.xlsx]Revenue'!C3",
+            },
+        })
+
+        from lineage.tracing.formula_tracer import scan_external_refs
+        refs = scan_external_refs(test_file, "model.xlsx", level=1, search_dirs=[tmp])
+
+        assert len(refs) >= 2
+        target_files = {r.target_file for r in refs}
+        assert "upstream.xlsx" in target_files
+        assert "source.xlsx" in target_files
+
+        for r in refs:
+            assert r.level == 1
+            assert r.source_file == "model.xlsx"
+            assert r.file_found is False  # files don't exist
+
+
+def test_trace_formula_levels_single_level():
+    """trace_formula_levels returns Level 1 refs for a single-level file."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmp = Path(tmpdir)
+        test_file = tmp / "model.xlsx"
+        _make_xlsx_with_external_formulas(test_file, {
+            "Sheet1": {
+                "A1": "'[missing.xlsx]Data'!B2:B20",
+            },
+        })
+
+        from lineage.tracing.formula_tracer import trace_formula_levels
+        results = trace_formula_levels(test_file, search_dirs=[tmp], max_level=5)
+
+        assert 1 in results
+        assert len(results[1]) >= 1
+        assert results[1][0].target_file == "missing.xlsx"
+        assert results[1][0].file_found is False
+        # Should stop at level 1 since no files found
+        assert 2 not in results
+
+
+def test_trace_formula_levels_two_levels():
+    """trace_formula_levels follows chain: model → upstream → upstream2."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmp = Path(tmpdir)
+
+        # Level 2 file: upstream.xlsx references upstream2.xlsx
+        upstream_file = tmp / "upstream.xlsx"
+        _make_xlsx_with_external_formulas(upstream_file, {
+            "Data": {
+                "A1": "'[upstream2.xlsx]Raw'!A1:A5",
+            },
+        })
+
+        # Level 1 file: model.xlsx references upstream.xlsx
+        model_file = tmp / "model.xlsx"
+        _make_xlsx_with_external_formulas(model_file, {
+            "Sheet1": {
+                "A1": "'[upstream.xlsx]Data'!A1",
+            },
+        })
+
+        from lineage.tracing.formula_tracer import trace_formula_levels
+        results = trace_formula_levels(model_file, search_dirs=[tmp], max_level=5)
+
+        assert 1 in results
+        assert any(r.target_file == "upstream.xlsx" for r in results[1])
+        assert any(r.file_found for r in results[1])  # upstream.xlsx exists
+
+        assert 2 in results
+        assert any(r.target_file == "upstream2.xlsx" for r in results[2])
+        assert not any(r.file_found for r in results[2])  # upstream2.xlsx doesn't exist
+
+
+def test_report_with_levels():
+    """TracingReporter.write_with_levels creates Level N sheets."""
+    from lineage.tracing.config import TraceConfig
+    from lineage.tracing.report import TracingReporter
+    from lineage.tracing.formula_tracer import ExternalReference
+
+    config = TraceConfig()
+    level_refs = {
+        1: [
+            ExternalReference(
+                level=1, source_file="model.xlsx", source_sheet="Sheet1",
+                source_cell="A1", formula="'[data.xlsx]Sheet1'!A1",
+                target_file="data.xlsx", target_sheet="Sheet1",
+                target_range="A1", target_path="data.xlsx",
+                file_found=True, resolved_path="/tmp/data.xlsx",
+            ),
+            ExternalReference(
+                level=1, source_file="model.xlsx", source_sheet="Sheet1",
+                source_cell="B1", formula="'[missing.xlsx]Sheet1'!B2",
+                target_file="missing.xlsx", target_sheet="Sheet1",
+                target_range="B2", target_path="missing.xlsx",
+                file_found=False, resolved_path="/tmp/missing.xlsx",
+            ),
+        ],
+    }
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        out_dir = Path(tmpdir)
+        reporter = TracingReporter()
+        out_path = reporter.write_with_levels(
+            [], [], config, Path("/tmp/model.xlsx"), "Sheet1",
+            [], out_dir, level_refs=level_refs,
+        )
+        assert out_path.exists()
+
+        import openpyxl
+        wb = openpyxl.load_workbook(str(out_path))
+        assert "Config" in wb.sheetnames
+        assert "Level 1" in wb.sheetnames
+
+        ws = wb["Level 1"]
+        # Header row
+        assert ws.cell(row=1, column=1).value == "Source File"
+        assert ws.cell(row=1, column=5).value == "Target File"
+        assert ws.cell(row=1, column=9).value == "File Found"
+
+        # Data rows
+        assert ws.cell(row=2, column=5).value == "data.xlsx"
+        assert ws.cell(row=2, column=9).value == "Yes"
+        assert ws.cell(row=3, column=5).value == "missing.xlsx"
+        assert ws.cell(row=3, column=9).value == "No"
+
+        # Check color: row 2 should be green, row 3 should be red/salmon
+        fill_found = ws.cell(row=2, column=1).fill.fgColor.rgb
+        fill_missing = ws.cell(row=3, column=1).fill.fgColor.rgb
+        # Green is C8E6C9, salmon is FFCDD2
+        assert "C8E6C9" in str(fill_found)
+        assert "FFCDD2" in str(fill_missing)
+
+
+# ---------------------------------------------------------------------------
+# Precedent tracing — unit tests
+# ---------------------------------------------------------------------------
+
+def test_expand_range():
+    """_expand_range handles single cells and ranges."""
+    from lineage.tracing.formula_tracer import _expand_range
+
+    assert _expand_range("A1") == ["A1"]
+    assert _expand_range("A1:A3") == ["A1", "A2", "A3"]
+    assert _expand_range("A1:B2") == ["A1", "B1", "A2", "B2"]
+    assert _expand_range("$C$3") == ["C3"]
+    assert _expand_range("$A$1:$A$3") == ["A1", "A2", "A3"]
+
+
+def test_expand_range_large():
+    """_expand_range caps overly large ranges."""
+    from lineage.tracing.formula_tracer import _expand_range
+
+    # A1:A1000000 would be 1M cells — should return empty (capped)
+    result = _expand_range("A1:A1000000")
+    assert result == []
+
+
+def test_parse_intra_refs_simple():
+    """_parse_intra_refs finds simple cell references."""
+    from lineage.tracing.formula_tracer import _parse_intra_refs
+
+    refs = _parse_intra_refs("B1*2", "Sheet1")
+    assert ("Sheet1", "B1") in refs
+
+
+def test_parse_intra_refs_range():
+    """_parse_intra_refs finds range references."""
+    from lineage.tracing.formula_tracer import _parse_intra_refs
+
+    refs = _parse_intra_refs("SUM(B1:B10)", "Sheet1")
+    assert any(r[1] == "B1:B10" for r in refs)
+
+
+def test_parse_intra_refs_cross_sheet():
+    """_parse_intra_refs finds cross-sheet references."""
+    from lineage.tracing.formula_tracer import _parse_intra_refs
+
+    refs = _parse_intra_refs("Sheet2!A1+B1", "Sheet1")
+    sheets = {r[0] for r in refs}
+    assert "Sheet2" in sheets
+    assert "Sheet1" in sheets
+
+
+def test_parse_intra_refs_quoted_sheet():
+    """_parse_intra_refs handles quoted sheet names."""
+    from lineage.tracing.formula_tracer import _parse_intra_refs
+
+    refs = _parse_intra_refs("'Data Sheet'!A1", "Sheet1")
+    assert ("Data Sheet", "A1") in refs
+
+
+def test_parse_intra_refs_excludes_external():
+    """_parse_intra_refs excludes references inside external workbook refs."""
+    from lineage.tracing.formula_tracer import _parse_intra_refs
+
+    # External ref: '[ext.xlsx]S1'!A1 — should NOT appear in intra refs
+    # But B1 should appear
+    refs = _parse_intra_refs("'[ext.xlsx]S1'!A1+B1", "Sheet1")
+    cell_refs = {r[1] for r in refs}
+    assert "B1" in cell_refs
+    # The A1 from the external ref should be excluded
+    # (it's inside the _REF_RE match span)
+
+
+def test_parse_intra_refs_dollar_signs():
+    """_parse_intra_refs strips dollar signs."""
+    from lineage.tracing.formula_tracer import _parse_intra_refs
+
+    refs = _parse_intra_refs("$B$5+$C$10:$D$20", "Sheet1")
+    cell_refs = {r[1] for r in refs}
+    assert "B5" in cell_refs
+    assert "C10:D20" in cell_refs
+
+
+def test_walk_precedents_direct_external():
+    """_walk_precedents finds nothing when the starting cell itself is external."""
+    from lineage.tracing.formula_tracer import _walk_precedents
+
+    # A1 directly references external — _walk_precedents is only called for
+    # cells WITHOUT direct external refs, so let's test a cell with a formula
+    # referencing B1, where B1 is external
+    cache = {
+        "Sheet1": {
+            "A1": "B1*2",
+            "B1": "'[source.xlsx]Data'!C3",
+        }
+    }
+    hits = _walk_precedents("Sheet1", "A1", cache, {})
+    assert len(hits) >= 1
+    assert hits[0].chain[-1][0] == "Sheet1"
+    assert hits[0].chain[-1][1] == "B1"
+    assert any(r[0] == "source.xlsx" for r in hits[0].external_refs)
+
+
+def test_walk_precedents_two_hops():
+    """_walk_precedents follows a 2-hop chain: A1 → B1 → C1 (external)."""
+    from lineage.tracing.formula_tracer import _walk_precedents
+
+    cache = {
+        "Sheet1": {
+            "A1": "B1+1",
+            "B1": "C1*2",
+            "C1": "'[source.xlsx]Data'!D5",
+        }
+    }
+    hits = _walk_precedents("Sheet1", "A1", cache, {})
+    assert len(hits) >= 1
+    # Chain should be B1 → C1
+    chain = hits[0].chain
+    assert len(chain) == 2
+    assert chain[0][1] == "B1"
+    assert chain[1][1] == "C1"
+
+
+def test_walk_precedents_cross_sheet():
+    """_walk_precedents follows cross-sheet references."""
+    from lineage.tracing.formula_tracer import _walk_precedents
+
+    cache = {
+        "Sheet1": {
+            "A1": "Sheet2!B1",
+        },
+        "Sheet2": {
+            "B1": "'[ext.xlsx]Data'!A1",
+        },
+    }
+    hits = _walk_precedents("Sheet1", "A1", cache, {})
+    assert len(hits) >= 1
+    assert hits[0].chain[-1][0] == "Sheet2"
+    assert hits[0].chain[-1][1] == "B1"
+
+
+def test_walk_precedents_circular():
+    """_walk_precedents terminates on circular references."""
+    from lineage.tracing.formula_tracer import _walk_precedents
+
+    cache = {
+        "Sheet1": {
+            "A1": "B1+1",
+            "B1": "A1+1",  # circular!
+        }
+    }
+    # Should not hang — visited set prevents infinite loop
+    hits = _walk_precedents("Sheet1", "A1", cache, {})
+    assert len(hits) == 0  # no external refs found
+
+
+def test_walk_precedents_dead_end():
+    """_walk_precedents handles cells with no formula (dead end)."""
+    from lineage.tracing.formula_tracer import _walk_precedents
+
+    cache = {
+        "Sheet1": {
+            "A1": "B1+1",
+            # B1 has no formula — it's a hardcoded value
+        }
+    }
+    hits = _walk_precedents("Sheet1", "A1", cache, {})
+    assert len(hits) == 0
+
+
+def test_walk_precedents_multiple_paths():
+    """_walk_precedents finds external refs through multiple paths."""
+    from lineage.tracing.formula_tracer import _walk_precedents
+
+    cache = {
+        "Sheet1": {
+            "A1": "B1+C1",
+            "B1": "'[file_b.xlsx]S1'!A1",
+            "C1": "'[file_c.xlsx]S2'!B2",
+        }
+    }
+    hits = _walk_precedents("Sheet1", "A1", cache, {})
+    assert len(hits) == 2
+    found_files = set()
+    for hit in hits:
+        for ref in hit.external_refs:
+            found_files.add(ref[0])
+    assert "file_b.xlsx" in found_files
+    assert "file_c.xlsx" in found_files
+
+
+def test_stream_all_formulas():
+    """_stream_all_formulas returns all formula cells."""
+    from lineage.tracing.formula_tracer import _stream_all_formulas
+
+    xml = b'''<?xml version="1.0" encoding="UTF-8"?>
+    <worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
+    <sheetData>
+      <row r="1">
+        <c r="A1"><f>B1*2</f><v>10</v></c>
+        <c r="B1"><v>5</v></c>
+        <c r="C1"><f>'[ext.xlsx]S1'!A1</f><v>100</v></c>
+      </row>
+    </sheetData>
+    </worksheet>'''
+
+    formulas = _stream_all_formulas(xml)
+    assert "A1" in formulas
+    assert "C1" in formulas
+    assert "B1" not in formulas  # no formula, just a value
+    assert formulas["A1"] == "B1*2"
+
+
+# ---------------------------------------------------------------------------
+# Precedent tracing — integration tests
+# ---------------------------------------------------------------------------
+
+def test_trace_transitive_two_hops():
+    """Level 2 finds external refs through transitive precedent chain."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmp = Path(tmpdir)
+
+        # upstream.xlsx: Data!A1 = B1*2, Data!B1 = '[source.xlsx]Raw'!C3
+        upstream_file = tmp / "upstream.xlsx"
+        _make_xlsx_with_external_formulas(upstream_file, {
+            "Data": {
+                "A1": "B1*2",
+                "B1": "'[source.xlsx]Raw'!C3",
+            },
+        })
+
+        # model.xlsx: Sheet1!A1 = '[upstream.xlsx]Data'!A1
+        model_file = tmp / "model.xlsx"
+        _make_xlsx_with_external_formulas(model_file, {
+            "Sheet1": {
+                "A1": "'[upstream.xlsx]Data'!A1",
+            },
+        })
+
+        from lineage.tracing.formula_tracer import trace_formula_levels
+        results = trace_formula_levels(model_file, search_dirs=[tmp], max_level=5)
+
+        assert 1 in results
+        assert any(r.target_file == "upstream.xlsx" for r in results[1])
+
+        # Level 2: should find source.xlsx through A1 → B1 chain
+        assert 2 in results
+        source_refs = [r for r in results[2] if r.target_file == "source.xlsx"]
+        assert len(source_refs) >= 1
+
+        ref = source_refs[0]
+        assert ref.source_cell == "A1"  # original cell in cell filter
+        assert ref.precedent_chain is not None
+        assert len(ref.precedent_chain) >= 1
+        # The chain should end at B1 which has the external ref
+        assert ref.precedent_chain[-1][1] == "B1"
+
+
+def test_trace_transitive_three_hops():
+    """Level 2 finds external refs through a 3-hop precedent chain."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmp = Path(tmpdir)
+
+        # upstream.xlsx: Data!A1 = B1+1, B1 = C1*2, C1 = '[source.xlsx]Raw'!D5
+        upstream_file = tmp / "upstream.xlsx"
+        _make_xlsx_with_external_formulas(upstream_file, {
+            "Data": {
+                "A1": "B1+1",
+                "B1": "C1*2",
+                "C1": "'[source.xlsx]Raw'!D5",
+            },
+        })
+
+        # model.xlsx
+        model_file = tmp / "model.xlsx"
+        _make_xlsx_with_external_formulas(model_file, {
+            "Sheet1": {
+                "A1": "'[upstream.xlsx]Data'!A1",
+            },
+        })
+
+        from lineage.tracing.formula_tracer import trace_formula_levels
+        results = trace_formula_levels(model_file, search_dirs=[tmp], max_level=5)
+
+        assert 2 in results
+        source_refs = [r for r in results[2] if r.target_file == "source.xlsx"]
+        assert len(source_refs) >= 1
+
+        ref = source_refs[0]
+        assert ref.precedent_chain is not None
+        assert len(ref.precedent_chain) == 2  # B1 → C1
+        assert ref.precedent_chain[0][1] == "B1"
+        assert ref.precedent_chain[1][1] == "C1"
+
+
+def test_trace_transitive_mixed_direct_and_indirect():
+    """Level 2 finds both direct and transitive external refs."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmp = Path(tmpdir)
+
+        # upstream.xlsx: Data!A1 = '[direct.xlsx]S1'!A1 (direct)
+        #                Data!B1 = C1*2, C1 = '[indirect.xlsx]S2'!B2 (transitive)
+        upstream_file = tmp / "upstream.xlsx"
+        _make_xlsx_with_external_formulas(upstream_file, {
+            "Data": {
+                "A1": "'[direct.xlsx]S1'!A1",
+                "B1": "C1*2",
+                "C1": "'[indirect.xlsx]S2'!B2",
+            },
+        })
+
+        # model.xlsx references both A1 and B1
+        model_file = tmp / "model.xlsx"
+        _make_xlsx_with_external_formulas(model_file, {
+            "Sheet1": {
+                "A1": "'[upstream.xlsx]Data'!A1",
+                "A2": "'[upstream.xlsx]Data'!B1",
+            },
+        })
+
+        from lineage.tracing.formula_tracer import trace_formula_levels
+        results = trace_formula_levels(model_file, search_dirs=[tmp], max_level=5)
+
+        assert 2 in results
+        target_files = {r.target_file for r in results[2]}
+        assert "direct.xlsx" in target_files
+        assert "indirect.xlsx" in target_files
+
+        # Direct ref should have no precedent chain
+        direct_ref = [r for r in results[2] if r.target_file == "direct.xlsx"][0]
+        assert direct_ref.precedent_chain is None
+
+        # Indirect ref should have a precedent chain
+        indirect_ref = [r for r in results[2] if r.target_file == "indirect.xlsx"][0]
+        assert indirect_ref.precedent_chain is not None
+        assert len(indirect_ref.precedent_chain) >= 1
+
+
+def test_report_with_precedent_chain():
+    """TracingReporter shows precedent chain column in Level sheets."""
+    from lineage.tracing.config import TraceConfig
+    from lineage.tracing.report import TracingReporter
+    from lineage.tracing.formula_tracer import ExternalReference
+
+    config = TraceConfig()
+    level_refs = {
+        2: [
+            ExternalReference(
+                level=2, source_file="upstream.xlsx", source_sheet="Data",
+                source_cell="A1", formula="B1*2",
+                target_file="source.xlsx", target_sheet="Raw",
+                target_range="C3", target_path="source.xlsx",
+                file_found=False, resolved_path="/tmp/source.xlsx",
+                precedent_chain=[("Data", "B1", "'[source.xlsx]Raw'!C3")],
+            ),
+            ExternalReference(
+                level=2, source_file="upstream.xlsx", source_sheet="Data",
+                source_cell="C1", formula="'[direct.xlsx]S1'!A1",
+                target_file="direct.xlsx", target_sheet="S1",
+                target_range="A1", target_path="direct.xlsx",
+                file_found=True, resolved_path="/tmp/direct.xlsx",
+                precedent_chain=None,
+            ),
+        ],
+    }
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        out_dir = Path(tmpdir)
+        reporter = TracingReporter()
+        out_path = reporter.write_with_levels(
+            [], [], config, Path("/tmp/model.xlsx"), "Sheet1",
+            [], out_dir, level_refs=level_refs,
+        )
+
+        import openpyxl
+        wb = openpyxl.load_workbook(str(out_path))
+        ws = wb["Level 2"]
+
+        # Header
+        assert ws.cell(row=1, column=11).value == "Precedent Chain"
+
+        # Row 2: transitive ref — should show chain
+        chain_text = ws.cell(row=2, column=11).value
+        assert "Data!B1" in chain_text
+        assert chain_text != "(direct)"
+
+        # Row 3: direct ref — should show "(direct)"
+        assert ws.cell(row=3, column=11).value == "(direct)"

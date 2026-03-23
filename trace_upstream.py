@@ -69,6 +69,17 @@ Examples:
         action="store_true",
         help="List sheet names in the model file and exit",
     )
+    parser.add_argument(
+        "--max-level",
+        type=int,
+        default=10,
+        help="Maximum recursion depth for formula-based tracing (default: 10)",
+    )
+    parser.add_argument(
+        "--no-formula-tracing",
+        action="store_true",
+        help="Disable recursive formula-based external reference tracing",
+    )
     args = parser.parse_args()
 
     model_path = Path(args.model_file).resolve()
@@ -170,11 +181,35 @@ Examples:
     print(f"  Approximate matches: {n_approx}")
     print(f"  Unmatched vectors:   {len(unmatched)}")
 
+    # ── Formula-based tracing ─────────────────────────────────────────
+    level_refs = None
+    if not args.no_formula_tracing:
+        from lineage.tracing.formula_tracer import trace_formula_levels
+
+        search_dirs = [model_path.parent]
+        level_refs = trace_formula_levels(
+            model_path,
+            search_dirs=search_dirs,
+            max_level=args.max_level,
+            verbose=args.verbose,
+        )
+        if level_refs:
+            total_refs = sum(len(r) for r in level_refs.values())
+            total_found = sum(
+                1 for refs in level_refs.values() for r in refs if r.file_found
+            )
+            total_missing = total_refs - total_found
+            print(f"\nFormula tracing: {len(level_refs)} level(s), "
+                  f"{total_refs} external ref(s) "
+                  f"({total_found} found, {total_missing} missing)")
+        else:
+            print("\nFormula tracing: no external formula references found")
+
     # Write report
     reporter = TracingReporter()
-    out_path = reporter.write(
+    out_path = reporter.write_with_levels(
         matches, unmatched, config, model_path, args.sheet,
-        upstream_paths, out_dir,
+        upstream_paths, out_dir, level_refs=level_refs,
     )
     print(f"\nReport: {out_path}")
 

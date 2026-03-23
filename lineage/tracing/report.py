@@ -3,9 +3,13 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from lineage.tracing.config import TraceConfig
 from lineage.tracing.models import TracingVector, VectorMatch
+
+if TYPE_CHECKING:
+    from lineage.tracing.formula_tracer import ExternalReference
 
 
 # Colour palette
@@ -17,6 +21,8 @@ _APPROX_HIGH_FILL = "BBDEFB"     # blue (high similarity)
 _APPROX_MED_FILL = "E3F2FD"      # lighter blue
 _UNMATCHED_FILL = "FFF9C4"       # yellow
 _ALT_TINT = "F5F5F5"             # alternating model-vector group
+_FOUND_FILL = "C8E6C9"           # green — file found on disk
+_MISSING_FILL = "FFCDD2"         # red/salmon — file not found
 
 
 def _fmt_sample(values: list[float], total: int) -> str:
@@ -238,6 +244,156 @@ class TracingReporter:
         widths = {
             "A": 16, "B": 12, "C": 10, "D": 38, "E": 10, "F": 18, "G": 12,
             "H": 28, "I": 20, "J": 16, "K": 20, "L": 12, "M": 10, "N": 38,
+        }
+        for col, w in widths.items():
+            ws.column_dimensions[col].width = w
+
+    # ------------------------------------------------------------------ #
+    # Formula tracing: Level N sheets
+    # ------------------------------------------------------------------ #
+
+    def write_with_levels(
+        self,
+        matches: list[VectorMatch],
+        unmatched: list[TracingVector],
+        config: TraceConfig,
+        model_path: Path,
+        sheet_name: str,
+        upstream_files: list[Path],
+        out_dir: Path,
+        level_refs: dict[int, list[ExternalReference]] | None = None,
+    ) -> Path:
+        """Write tracing results AND formula-level sheets to one workbook.
+
+        If *level_refs* is provided, adds one sheet per level ("Level 1",
+        "Level 2", ...) after the value-tracing sheets.
+        """
+        try:
+            from openpyxl import Workbook
+            from openpyxl.styles import PatternFill, Font, Alignment, Border, Side
+            from openpyxl.utils import get_column_letter
+        except ImportError as e:
+            raise ImportError(f"openpyxl is required for Excel reporting: {e}")
+
+        stem = model_path.stem
+        out = out_dir / f"upstream_tracing_{stem}.xlsx"
+
+        wb = Workbook()
+        wb.remove(wb.active)
+
+        # Shared styles
+        hdr_fill = PatternFill("solid", fgColor=_HDR_FILL)
+        hdr_font = Font(bold=True, color=_HDR_TEXT, size=11)
+        hdr_align = Alignment(horizontal="center", vertical="center", wrap_text=True)
+        thin = Side(style="thin", color="CCCCCC")
+        border = Border(left=thin, right=thin, top=thin, bottom=thin)
+        hdr_border = Border(
+            left=Side(style="medium", color="FFFFFF"),
+            right=Side(style="medium", color="FFFFFF"),
+            top=Side(style="medium", color="FFFFFF"),
+            bottom=Side(style="medium", color="FFFFFF"),
+        )
+
+        # ── Config sheet ───────────────────────────────────────────────
+        ws_cfg = wb.create_sheet("Config")
+        self._write_config_sheet(
+            ws_cfg, config, model_path, sheet_name, upstream_files,
+            matches, unmatched, hdr_fill, hdr_font, hdr_align, hdr_border, border,
+        )
+
+        # ── Tracing Results sheet (only if we have value-tracing data) ─
+        if matches or unmatched:
+            ws_res = wb.create_sheet("Tracing Results")
+            self._write_results_sheet(
+                ws_res, matches, unmatched,
+                hdr_fill, hdr_font, hdr_align, hdr_border, border, get_column_letter,
+            )
+
+        # ── Level N sheets ─────────────────────────────────────────────
+        if level_refs:
+            for level in sorted(level_refs.keys()):
+                ws = wb.create_sheet(f"Level {level}")
+                self._write_level_sheet(
+                    ws, level, level_refs[level],
+                    hdr_fill, hdr_font, hdr_align, hdr_border, border,
+                    get_column_letter,
+                )
+
+        wb.save(str(out))
+        return out
+
+    @staticmethod
+    def _fmt_chain(chain: list[tuple[str, str, str]] | None) -> str:
+        """Format a precedent chain for display."""
+        if not chain:
+            return "(direct)"
+        parts = []
+        for sheet, cell, formula in chain:
+            snippet = formula[:80]
+            if len(formula) > 80:
+                snippet += "..."
+            parts.append(f"{sheet}!{cell} (={snippet})")
+        return " → ".join(parts)
+
+    def _write_level_sheet(
+        self, ws, level: int, refs: list[ExternalReference],
+        hdr_fill, hdr_font, hdr_align, hdr_border, border, get_column_letter,
+    ):
+        """Write one "Level N" sheet with formula external references."""
+        from openpyxl.styles import PatternFill, Font, Alignment
+
+        headers = [
+            "Source File",       # A
+            "Source Sheet",      # B
+            "Source Cell",       # C
+            "Formula",           # D
+            "Target File",       # E
+            "Target Sheet",      # F
+            "Target Range",      # G
+            "Target Path",       # H
+            "File Found",        # I
+            "Resolved Path",     # J
+            "Precedent Chain",   # K
+        ]
+
+        # Header row
+        for ci, h in enumerate(headers, 1):
+            cell = ws.cell(row=1, column=ci, value=h)
+            cell.fill = hdr_fill
+            cell.font = hdr_font
+            cell.alignment = hdr_align
+            cell.border = hdr_border
+        ws.row_dimensions[1].height = 22
+        ws.freeze_panes = "A2"
+
+        found_fill = PatternFill("solid", fgColor=_FOUND_FILL)
+        missing_fill = PatternFill("solid", fgColor=_MISSING_FILL)
+
+        for ri, ref in enumerate(refs, 2):
+            fill = found_fill if ref.file_found else missing_fill
+            row_data = [
+                ref.source_file,
+                ref.source_sheet,
+                ref.source_cell,
+                ref.formula,
+                ref.target_file,
+                ref.target_sheet,
+                ref.target_range,
+                ref.target_path,
+                "Yes" if ref.file_found else "No",
+                ref.resolved_path,
+                self._fmt_chain(ref.precedent_chain),
+            ]
+            for ci, value in enumerate(row_data, 1):
+                cell = ws.cell(row=ri, column=ci, value=value)
+                cell.fill = fill
+                cell.border = border
+
+        # Column widths
+        ws.auto_filter.ref = f"A1:{get_column_letter(len(headers))}1"
+        widths = {
+            "A": 24, "B": 20, "C": 10, "D": 60, "E": 24,
+            "F": 20, "G": 14, "H": 50, "I": 10, "J": 50, "K": 60,
         }
         for col, w in widths.items():
             ws.column_dimensions[col].width = w

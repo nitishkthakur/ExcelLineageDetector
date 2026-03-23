@@ -22,6 +22,14 @@ Always use the project venv at `.venv/`:
 # Upstream tracing — trace hardcoded vectors back to source files
 .venv/bin/python trace_upstream.py model.xlsx --sheet "Sheet1" --upstream-dir ./sources/
 .venv/bin/python trace_upstream.py model.xlsx --list-sheets
+
+# Formula tracing options
+.venv/bin/python trace_upstream.py model.xlsx --sheet "Sheet1" --upstream-dir ./sources/ --max-level 3
+.venv/bin/python trace_upstream.py model.xlsx --sheet "Sheet1" --upstream-dir ./sources/ --no-formula-tracing
+
+# Convert upstream tracing report to Mermaid flowchart
+.venv/bin/python trace_upstream_mermaid.py upstream_tracing_model.xlsx
+.venv/bin/python trace_upstream_mermaid.py upstream_tracing_model.xlsx --lr -o diagram.md
 ```
 
 ## Architecture
@@ -101,7 +109,7 @@ Each extractor in `lineage/extractors/` handles one ZIP region. Never raise exce
 .venv/bin/python tests/test_generator.py
 ```
 
-There are 19 tests in `test_detector.py` covering: coverage rate, required fields, deduplication, serialisation, all three reporters (JSON/Excel/PNG), all four parsers, and specific assertions for hardcoded values, source notes, Bloomberg formulas, SharePoint external links, SQL table extraction, and the Excel report structure (All Connections + per-sheet vector sheets).
+There are 72 tests total: 19 in `test_detector.py` (coverage rate, required fields, deduplication, serialisation, all three reporters, all four parsers, hardcoded values, source notes, Bloomberg formulas, SharePoint external links, SQL table extraction, Excel report structure) and 53 in `test_tracing.py` (config, scanner, exact/approximate matchers, batch kernels, end-to-end tracer, report, formula tracer helpers, streaming parser, cell filter, regex parsing, file resolution, multi-level tracing, report with Level sheets, precedent walking unit tests, transitive integration tests, precedent chain report rendering).
 
 **When adding a new planted connection type** to the generator: add it to the `planted` list at the bottom of `generate_test_workbook()`, inject its XML/data in one of the `Step 3` blocks, and add a focused test function in `test_detector.py`.
 
@@ -118,7 +126,13 @@ trace_upstream.py (CLI)
       → scan_upstream_file() × N       # parallel, ALL numerics (formula + hardcoded)
       → ExactMatcher.match()           # lineage/tracing/exact_matcher.py
       → ApproximateMatcher.match()     # lineage/tracing/approx_matcher.py
-  → TracingReporter.write()            # lineage/tracing/report.py
+  → trace_formula_levels()             # lineage/tracing/formula_tracer.py (recursive)
+  → TracingReporter.write_with_levels()# lineage/tracing/report.py
+
+trace_upstream_mermaid.py (CLI — post-processing)
+  → reads upstream_tracing_*.xlsx (Level N sheets)
+  → builds Mermaid flowchart (file → sheet → range edges across levels)
+  → writes *_mermaid.md
 ```
 
 **Key modules:**
@@ -131,7 +145,10 @@ trace_upstream.py (CLI)
 | `exact_matcher.py` | Hash-based O(1) lookup + batched numpy subsequence matching |
 | `approx_matcher.py` | Vectorized numpy similarity (Pearson/cosine/Euclidean) with sliding window |
 | `tracer.py` | Orchestrator: parallel scanning, match coordination, result assembly |
-| `report.py` | Excel report writer: Config sheet + Tracing Results sheet |
+| `report.py` | Excel report writer: Config sheet + Tracing Results sheet + Level N sheets |
+| `formula_tracer.py` | Recursive formula-based external reference tracing (Level 1, 2, ...) |
+
+**Formula tracing** (`formula_tracer.py`): Scans formulas referencing external workbooks (`'[file.xlsx]Sheet'!A1` or `[1]Sheet!A1`), then recursively follows those references through multiple levels. Level 1 scans the entire model file; Level 2+ scans only the cell ranges identified at the previous level. Uses `CellFilter` for rectangle-based scoping and `_get_link_map()` to resolve numeric external link indices via `.rels` files. **Transitive precedent walking**: For Level 2+, if a target cell's formula does NOT directly reference an external file but depends on other cells that do (through arbitrary intermediate formulas), the in-workbook dependency graph is walked via BFS until external references are found or the chain dead-ends. Handles cross-sheet references, circular reference safety (`visited` set), and caps at `_MAX_PRECEDENT_DEPTH=20` / `_MAX_CELLS_VISITED=10,000`. The `ExternalReference.precedent_chain` field records the intermediate cells traversed. Stops when upstream file is not found on disk or `max_level` is reached. Cycle prevention via `visited_files` set.
 
 **Configuration** (`tracing_config.json`):
 - `matching.exact` / `matching.approximate` — enable/disable match modes

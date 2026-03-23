@@ -1,0 +1,8 @@
+Ok. Answer the following question. When going to level 2, 3 analysis, when the code looks at an upstream link - say in a level 1 file and then decides to take the next step, does it 
+ look at if that level 1 formula was directly referencing an upstream file? Or is it that it sees also if any preceedent of that level 2 formula within the same file relied on an    
+upstream file. ? Let me know if the question was clear
+
+
+A cell could pull from an external file indirectly through intermediate formulas within the same workbook, and the current code wouldn't catch that.
+
+Implement this feature - as I see this as a real gap

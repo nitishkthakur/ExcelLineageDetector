@@ -49,8 +49,20 @@ Financial analysts build model spreadsheets by copy-pasting values from upstream
      → sliding-window for length-mismatched vectors
      → top-N by similarity score
 
-5. REPORT
+5. RECURSIVE FORMULA TRACING  (streaming XML, scoped by CellFilter)
+   Model file (all cells)
+     → Level 1: find all formulas referencing external workbooks
+     → Level 2+: scan only referenced cell ranges in upstream files
+     → stop when file not found on disk or max_level reached
+
+6. REPORT
    → upstream_tracing_<name>.xlsx
+     (Config + Tracing Results + Level 1, Level 2, ...)
+
+7. MERMAID VISUALISATION  (optional, trace_upstream_mermaid.py)
+   → reads Level N sheets from the report
+   → aggregates edges (source sheet → target sheet, labelled with cell ranges)
+   → outputs *_mermaid.md with fenced mermaid code block
 ```
 
 ---
@@ -180,12 +192,12 @@ After computing all candidate matches:
 
 ## Phase 4: Report
 
-The output Excel report (`upstream_tracing_<name>.xlsx`) has two sheets:
+The output Excel report (`upstream_tracing_<name>.xlsx`) contains:
 
 ### Config Sheet
 Lists all configuration parameters, model file, upstream files, and summary statistics.
 
-### Tracing Results Sheet
+### Tracing Results Sheet (value-based matching)
 
 | Column | Description |
 |--------|-------------|
@@ -209,6 +221,44 @@ Color coding:
 - **Light green**: exact subsequence match
 - **Blue** (gradient): approximate match (darker = higher similarity)
 - **Yellow**: unmatched model vector
+
+### Level N Sheets (formula-based tracing)
+
+If formula tracing is enabled (default), one sheet per recursion level is appended:
+
+| Column | Description |
+|--------|-------------|
+| Source File | File containing the formula |
+| Source Sheet | Sheet containing the formula |
+| Source Cell | Cell reference (e.g., `A1`) |
+| Formula | Formula text (truncated to 300 chars) |
+| Target File | Referenced workbook filename |
+| Target Sheet | Referenced sheet name |
+| Target Range | Referenced cell range |
+| Target Path | Full path from formula/rels |
+| File Found | Whether target file exists on disk |
+| Resolved Path | Actual disk path if found |
+
+Color coding:
+- **Green**: target file found on disk
+- **Red/salmon**: target file NOT found on disk (chain stops here)
+
+### Mermaid Flowchart (`trace_upstream_mermaid.py`)
+
+A standalone post-processing script that reads the Level N sheets from the report and produces a Mermaid flowchart diagram. The diagram shows the upstream connection graph at file/sheet/range granularity — suitable for sharing with non-technical stakeholders.
+
+**Algorithm:**
+1. Read all "Level N" sheets from the report using openpyxl (read-only mode)
+2. Aggregate edges: group source cells that point to the same (src_file, src_sheet) → (tgt_file, tgt_sheet, tgt_range) into a single edge with a compact label
+3. Build subgraph per file (containing sheet nodes), with `classDef missing` styling for files not found on disk
+4. Output a fenced mermaid code block to a `.md` file
+
+**Design choices:**
+- Files are subgraphs, sheets are nodes — keeps the diagram clean at the right level of abstraction
+- Edge labels show `"source_cells → target_range"` — enough detail without overwhelming
+- Multiple source cells are aggregated (up to 3 shown, then `"... (N cells)"`)
+- Red/green styling matches the Excel report colours
+- Supports `--lr` for left-to-right layout (useful for wide chains) and `TB` (default, better for deep chains)
 
 ---
 
@@ -273,3 +323,103 @@ All settings are in `tracing_config.json`:
 - If `exact=false, approximate=true`: only approximate matches, no hash index built
 - If `exact=true, approximate=true` (default): exact matches shown first, then top-N approximate (excluding already-exact-matched upstream vectors)
 - `subsequence_matching` only applies to exact matching; approximate matching always supports length mismatch via sliding window
+
+---
+
+## Phase 5: Recursive Formula Tracing
+
+In addition to value-based matching, the tracer follows **formulas that reference external workbooks** through multiple levels. This is separate from value matching and does not involve similarity comparison — formulas directly point to specific cells in specific files.
+
+### Formula Reference Patterns
+
+External workbook references in Excel formulas take two forms:
+
+| Pattern | Example | Resolution |
+|---------|---------|-----------|
+| Literal filename | `'[budget.xlsx]Revenue'!A1:A10` | Filename extracted directly |
+| Numeric index | `[1]Sheet1!B5` | Index `[n]` → `xl/externalLinks/externalLink{n}.xml` → `.rels` file → actual path |
+
+The regex `_REF_RE` captures both forms, handling optional path prefixes (local, UNC, SharePoint URLs) before the `[filename]` bracket.
+
+### Recursive Scoping
+
+**Level 1** scans the entire model file — all sheets, all cells — for formulas containing external workbook references. Uses streaming XML (constant memory).
+
+**Level 2+** uses `CellFilter` to scope scanning to only the cell ranges identified at the previous level:
+
+```
+Level 1: model.xlsx (all cells)
+  → finds [upstream.xlsx]Data!A1:A10 in cell C5
+
+Level 2: upstream.xlsx (only Data!A1:A10)
+  → A1 = B1 * 2 (no direct external ref)
+  → walks precedents: B1 = C1 + 100, C1 = '[source.xlsx]Raw'!D5
+  → reports source.xlsx with precedent chain A1 → B1 → C1
+
+Level 3: source.xlsx (only Raw!D5)
+  → file not found → stop, flag as missing
+```
+
+### Transitive Precedent Walking
+
+At Level 2+, a target cell may not directly reference an external file — its formula may depend on other cells within the same workbook that do. The tracer handles this via **BFS precedent walking**:
+
+1. For each filtered cell that has a formula **without** `[` (no direct external ref):
+   a. Parse intra-workbook cell references from the formula using `_INTRA_REF_RE`
+   b. Add those cells to a BFS queue
+   c. For each queued cell:
+      - If its formula contains `[`: parse external refs, record hit with full precedent chain
+      - Else: parse its intra-refs and continue walking
+   d. Track visited cells to prevent infinite loops from circular references
+
+**Key features:**
+- **Cross-sheet support**: `Sheet2!A1` references are followed across sheets within the same workbook
+- **Range expansion**: `SUM(B1:B10)` expands to individual cells B1, B2, ..., B10 (capped at 10,000 cells)
+- **Arbitrary depth**: Follows chains up to 20 hops deep (configurable via `_MAX_PRECEDENT_DEPTH`)
+- **Circular reference safety**: `visited` set prevents infinite BFS loops
+- **Multiple paths**: If a cell depends on multiple precedents that each lead to different external files, all are reported
+- **Memory guard**: Max 10,000 cells visited per starting cell (`_MAX_CELLS_VISITED`)
+
+**Implementation details:**
+- Level 1 uses `_stream_external_formulas` (streaming, constant memory) — only cells with `[` are captured
+- Level 2+ uses `_load_formula_cache` to load ALL formulas from ALL sheets into `dict[str, dict[str, str]]` (sheet → cell → formula). This enables O(1) random access for precedent lookups. Memory: ~5MB for 100K formula cells.
+- Intra-workbook references are parsed by `_INTRA_REF_RE`, which captures `A1`, `$B$5`, `Sheet2!A1:B10`, `'Sheet Name'!C3` patterns. Matches overlapping with `_REF_RE` (external reference) spans are excluded.
+
+### Cycle Prevention
+
+A `visited_files` set tracks all files already scanned across levels. If a file appears at multiple levels (e.g., A → B → A), it is only scanned once. This prevents infinite recursion in circular reference chains between files.
+
+Within a single file, BFS precedent walking uses a per-cell `visited` set to prevent infinite loops from circular formula references (e.g., A1=B1, B1=A1).
+
+### Data Model
+
+Each external reference is stored as an `ExternalReference`:
+
+| Field | Description |
+|-------|-------------|
+| `level` | Tracing level (1, 2, 3, ...) |
+| `source_file` | File containing the formula |
+| `source_sheet` | Sheet containing the formula |
+| `source_cell` | Cell reference (e.g., `A1`) — the cell in the CellFilter range |
+| `formula` | Formula text of the source cell (truncated to 300 chars) |
+| `target_file` | Referenced workbook filename |
+| `target_sheet` | Referenced sheet name |
+| `target_range` | Referenced cell range (e.g., `A1:A10`) |
+| `target_path` | Full path from formula/rels |
+| `file_found` | Whether target file exists on disk |
+| `resolved_path` | Actual disk path if found |
+| `precedent_chain` | `None` for direct references; `list[(sheet, cell, formula)]` for transitive references — the intermediate cells from source_cell to the cell with the external ref |
+
+### File Resolution
+
+1. Search the model file's directory for an exact filename match
+2. Fall back to case-insensitive search
+3. If not found, return expected path with `file_found=False`
+
+The tracer extracts just the filename from formula paths (which may include local paths, UNC paths, or SharePoint URLs) and searches in the model file's directory.
+
+### Known Limitations
+
+- **Named ranges**: Formulas referencing defined names (e.g., `=Revenue_Total`) are not resolved to cell addresses. This would require parsing `xl/workbook.xml` definedNames.
+- **R1C1-style references**: Only A1-style cell references are supported (Excel normalises to A1-style in stored XML, so this rarely matters).
+- **Structured table references**: `Table1[Column1]` syntax is not parsed for precedent walking (though it won't be confused with external references).

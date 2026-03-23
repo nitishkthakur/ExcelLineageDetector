@@ -1,0 +1,19 @@
+<goal>
+I need you to expand beyond identifying where the hardcoded values come from. 
+1. I need you to focus on formulas which refer to other external excel files. Those formulas which refer to external excel files are also to be included now, in the report. Document them the same way as you did with hardcoded values: With the exact formula ranges, cell ranges in both the model file and the upstream input files - but in this case, No need to do matching of course because the formula directly points to the cells, sheet, wrkbooks. Document them in the same way. We will call this a level 1 analysis because it goes back one level (to one upstream file)
+2. Do this recursively level 2, level 3, etc till you no longer find the upstream file on disk. So, for each upstream excel file that you identify, Implement this upstream file based source identification. **Important** No need to analyse hardcoded values here. Only cells which have external references to other files. 
+</goal>
+
+<context>
+I am trying to form a full requirements excel file which traces back as far as possible the original sources of information given a model file. The user will share some potential input files which may be linked via formulas. However, they may not share all the files - which is why, at some point, the excel upstream file linked, will not be found in the location.
+1.  All the files they share will be in the same folder as the model file which you will run on but the linked formula might point to onedrive or sharepoint or someone else's filepath. Make sure to extract the name of the file from it only for the next level Analysis. 
+2. These must be added to the same report under tabs named level 1, level 2 - in the same upstream_tracing file. 
+3. Level 1 sheet contains detailed cell range, sheet, file references to all the external file references and their source and target info
+4. For each upstream file Identified in level 1, do a level 2 analysis BUT ONLY FOR THE CELL RANGES of the file IDENTIFIED IN LEVEL 1 - which means exploring their formulas and tracing those back to their ancestor files. 
+5. If at any point, the upstream file referenced in formula is not found, then FLAG it and color the row in the report in red/salmon.
+6. Again, focus on doing this very fast. Decide on this aspect carefully
+7. Test your implementation
+</context>
+
+
+

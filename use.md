@@ -220,16 +220,24 @@ Results: 91 model vectors
   Approximate matches: 435
   Unmatched vectors:   4
 
+Formula tracing: 2 level(s), 14 external ref(s) (10 found, 4 missing)
+
 Report: ./results/upstream_tracing_model.xlsx
 ```
 
 ### Understanding the report
 
-The output file `upstream_tracing_<name>.xlsx` has two sheets:
+The output file `upstream_tracing_<name>.xlsx` has the following sheets:
 
 **Config** — lists all settings and summary statistics.
 
-**Tracing Results** — one row per match:
+**Tracing Results** — one row per match (value-based tracing):
+
+*If formula tracing finds external references, additional sheets are appended:*
+
+**Level 1, Level 2, ...** — one sheet per recursion depth showing formulas that reference external workbooks (see [Formula-Based Recursive Tracing](#formula-based-recursive-tracing) below).
+
+#### Tracing Results columns
 
 | Column | Description |
 |--------|-------------|
@@ -308,3 +316,156 @@ Upstream scanning uses parallel processing (`ProcessPoolExecutor`). All matching
 ### Algorithm details
 
 See `upstream_algorithm.md` for the full algorithm documentation including complexity analysis, similarity metrics, and optimization strategies.
+
+---
+
+## Formula-Based Recursive Tracing
+
+In addition to hardcoded value matching, `trace_upstream.py` performs **recursive formula-based tracing** — following formulas that reference external Excel workbooks through multiple levels until the upstream file is no longer found on disk.
+
+### How it works
+
+**Level 1**: Scans ALL cells in the model file for formulas referencing external workbooks (e.g. `'[budget.xlsx]Revenue'!A1:A10` or `[1]Sheet1!B5`). Records source cell, target file, sheet, and range.
+
+**Level 2+**: For each upstream file found at Level 1, scans ONLY the cell ranges referenced at Level 1 (not the entire file) for further external references. Continues recursively.
+
+**Stops when**: No new upstream files are found, the referenced file doesn't exist on disk, or `--max-level` is reached.
+
+### Usage
+
+```bash
+# Formula tracing is automatic (runs alongside value tracing)
+.venv/bin/python trace_upstream.py model.xlsx --sheet "Revenue" \
+    --upstream-dir ./data/
+
+# Disable formula tracing (value matching only)
+.venv/bin/python trace_upstream.py model.xlsx --sheet "Revenue" \
+    --upstream-dir ./data/ --no-formula-tracing
+
+# Limit recursion depth
+.venv/bin/python trace_upstream.py model.xlsx --sheet "Revenue" \
+    --upstream-dir ./data/ --max-level 3
+```
+
+### Report output
+
+Formula tracing results are added to the same `upstream_tracing_<name>.xlsx` report:
+
+- **Level 1** tab — all external formula references from the model file
+- **Level 2** tab — external references found in Level 1's target cells
+- **Level N** tab — continues recursively
+
+Each row in a Level sheet:
+
+| Column | Description |
+|--------|-------------|
+| Source File | File containing the formula |
+| Source Sheet | Sheet containing the formula |
+| Source Cell | Cell reference (e.g. `A1`) |
+| Formula | Formula text (truncated to 300 chars) |
+| Target File | Referenced workbook filename |
+| Target Sheet | Referenced sheet name |
+| Target Range | Referenced cell range |
+| Target Path | Full path from formula/rels (for display) |
+| File Found | Yes/No |
+| Resolved Path | Actual disk path if found |
+| Precedent Chain | How the source cell transitively depends on the external file (see below) |
+
+**Row colours:**
+- **Green** = target file found on disk
+- **Red/salmon** = target file NOT found (chain stops here)
+
+### Transitive precedent walking
+
+A target cell may not directly reference an external file — it might depend on other cells within the same workbook that do. For example:
+
+```
+upstream.xlsx:
+  Data!A1 = B1 * 2           ← A1 does NOT reference an external file
+  Data!B1 = C1 + 100         ← B1 does NOT reference an external file
+  Data!C1 = '[source.xlsx]Raw'!D5  ← C1 DOES reference an external file
+```
+
+If the model file references `upstream.xlsx!Data!A1`, the tracer follows the in-workbook precedent chain `A1 → B1 → C1` until it finds the external reference to `source.xlsx`. The **Precedent Chain** column shows this as:
+
+```
+Data!B1 (=C1+100) → Data!C1 (='[source.xlsx]Raw'!D5)
+```
+
+This works across sheets within the same workbook, handles chains of arbitrary depth (up to 20 hops), safely terminates on circular references, and expands range references like `SUM(B1:B10)`.
+
+For direct external references (where the source cell itself contains `[file.xlsx]`), the Precedent Chain column shows `(direct)`.
+
+### External reference resolution
+
+Formulas may reference files by literal name (`'[budget.xlsx]Sheet1'!A1`) or by numeric index (`[1]Sheet1!A1`). Numeric indices map to `xl/externalLinks/externalLink{n}.xml`, where the `.rels` file holds the actual path (local, UNC, or SharePoint URL). The tracer extracts the filename from the path and searches for it in the model file's directory.
+
+---
+
+## Mermaid Flowchart — Visualising Upstream Connections
+
+After generating an upstream tracing report, you can convert the Level sheets into a **Mermaid flowchart** that shows how files, sheets, and cell ranges connect across levels.
+
+### Quick start
+
+```bash
+# Generate a Mermaid diagram from a tracing report
+.venv/bin/python trace_upstream_mermaid.py upstream_tracing_model.xlsx
+
+# Left-to-right layout (default is top-to-bottom)
+.venv/bin/python trace_upstream_mermaid.py upstream_tracing_model.xlsx --lr
+
+# Custom output path
+.venv/bin/python trace_upstream_mermaid.py upstream_tracing_model.xlsx -o flowchart.md
+```
+
+### What the diagram shows
+
+- Each **file** is a subgraph (box) containing its sheets as nodes
+- **Arrows** connect source sheet → target sheet, labelled with the source cell(s) and target range
+- **Green** subgraphs = files found on disk
+- **Red** subgraphs = files NOT found on disk (chain stops here)
+- Multiple source cells pointing to the same target are aggregated into a single edge
+
+### Rendering
+
+The output is a Markdown file with a fenced `mermaid` code block. It renders natively in:
+
+- **GitHub** — paste into a README, PR description, or issue
+- **VS Code** — with the Markdown Preview Mermaid Support extension
+- **Mermaid Live Editor** — paste at [mermaid.live](https://mermaid.live)
+
+### Example output
+
+For a model that references `source1.xlsx` and `source2.xlsx`, which in turn reference `raw_data.xlsx` and `bloomberg.xlsx`:
+
+```mermaid
+flowchart TB
+    subgraph f_model_xlsx["model.xlsx"]
+        s_model_xlsx_Revenue["Revenue"]
+    end
+    subgraph f_source1_xlsx["source1.xlsx"]
+        s_source1_xlsx_Data["Data"]
+    end
+    subgraph f_source2_xlsx["source2.xlsx"]
+        s_source2_xlsx_Rates["Rates"]
+    end
+    subgraph f_raw_data_xlsx["raw_data.xlsx"]
+        s_raw_data_xlsx_Import["Import"]
+    end
+    subgraph f_bloomberg_xlsx["bloomberg.xlsx"]
+        s_bloomberg_xlsx_FX["FX"]
+    end
+
+    s_model_xlsx_Revenue -->|"'B5 → A1:A10'"| s_source1_xlsx_Data
+    s_model_xlsx_Revenue -->|"'C10 → B1'"| s_source2_xlsx_Rates
+    s_source1_xlsx_Data -->|"'A5 → D1:D20'"| s_raw_data_xlsx_Import
+    s_source2_xlsx_Rates -->|"'B1 → E1'"| s_bloomberg_xlsx_FX
+
+    classDef missing fill:#FFCDD2,stroke:#C62828,stroke-width:2px,color:#B71C1C
+    classDef found fill:#C8E6C9,stroke:#2E7D32,stroke-width:1px
+```
+
+### Performance
+
+Formula tracing uses the same `lxml.etree.iterparse` streaming approach as the hardcoded vector scanner. Level 1 uses streaming-only scanning (constant memory). Level 2+ loads all formulas from the upstream file into a dict cache for random-access precedent lookups — typically ~5MB for a workbook with 100K formula cells. Precedent walking uses BFS with safety caps (max 20 depth, 10,000 cells visited per starting cell) to prevent runaway chains.
