@@ -81,12 +81,32 @@ def make_upstream_a():
     # Rows 2-9: formulas referencing upstream_B.xlsx
     for i in range(2, 10):
         ws.cell(i, 1, f"Q{((i-2)%4)+1}-{2024 + (i-2)//4}")
-        # B = Revenue - COGS  (references upstream_B)
+        # B = Revenue - COGS  (references upstream_B directly)
         ws.cell(i, 2).value = f"='[upstream_B.xlsx]RawData'!B{i}-'[upstream_B.xlsx]RawData'!C{i}"
-        # C = Revenue / Headcount  (references upstream_B)
+        # C = Revenue / Headcount  (references upstream_B directly)
         ws.cell(i, 3).value = f"='[upstream_B.xlsx]RawData'!B{i}/'[upstream_B.xlsx]RawData'!D{i}"
-        # D = Revenue * FX rate (references TWO sheets in upstream_B)
-        ws.cell(i, 4).value = f"='[upstream_B.xlsx]RawData'!B{i}*'[upstream_B.xlsx]FXRates'!B{i}"
+        # D = Revenue * adjusted FX — PURE INDIRECTION via Helpers sheet
+        # Processed!D{i} -> Helpers!B{i} -> upstream_B FXRates + macro_data.xlsx (missing)
+        # No '[' in this formula — tests precedent walking
+        ws.cell(i, 4).value = f"=B{i}*Helpers!B{i}"
+
+    # Helpers sheet — intermediate formulas that reference external files.
+    # This tests cross-sheet precedent walking: Processed!D -> Helpers!B -> external files
+    ws_help = wb.create_sheet("Helpers")
+    ws_help["A1"] = "Quarter"
+    ws_help["B1"] = "Adjusted FX"
+    ws_help["C1"] = "Inflation Factor"
+    for i in range(2, 10):
+        ws_help.cell(i, 1, f"Q{((i-2)%4)+1}-{2024 + (i-2)//4}")
+        # B = FX rate from upstream_B, adjusted by inflation from a MISSING file
+        # This creates: Processed!D -> Helpers!B -> upstream_B + macro_data.xlsx (missing)
+        ws_help.cell(i, 2).value = (
+            f"='[upstream_B.xlsx]FXRates'!B{i}*C{i}"
+        )
+        # C = inflation factor from a file that does NOT exist
+        ws_help.cell(i, 3).value = (
+            f"='[macro_data.xlsx]Inflation'!A{i}"
+        )
 
     # Also have a "Summary" sheet with some hardcoded values (manually entered)
     ws2 = wb.create_sheet("Summary")
@@ -119,15 +139,19 @@ def make_model():
     ws["A1"] = "Quarter"
     ws["B1"] = "Gross Profit (from upstream)"
     ws["C1"] = "Rev per Head (from upstream)"
-    ws["D1"] = "Margin %"
+    ws["D1"] = "Revenue (EUR)"
+    ws["E1"] = "Margin %"
 
     for i in range(2, 10):
         ws.cell(i, 1, f"Q{((i-2)%4)+1}-{2024 + (i-2)//4}")
         # Formula referencing upstream_A
         ws.cell(i, 2).value = f"='[upstream_A.xlsx]Processed'!B{i}"
         ws.cell(i, 3).value = f"='[upstream_A.xlsx]Processed'!C{i}"
-        # A local formula using the pulled data
-        ws.cell(i, 4).value = f"=B{i}/('[upstream_A.xlsx]Processed'!B{i}+'[upstream_A.xlsx]Processed'!C{i})"
+        # Revenue EUR — pulls Processed!D which uses cross-sheet indirection
+        # Chain: model:D -> upstream_A:Processed!D -> upstream_A:Helpers!B -> external files
+        ws.cell(i, 4).value = f"='[upstream_A.xlsx]Processed'!D{i}"
+        # Margin uses local data
+        ws.cell(i, 5).value = f"=B{i}/(B{i}+C{i})"
 
     # --- Section 2: Hardcoded values (copy-pasted from upstream_B) ---
     # These are the EXACT revenue numbers from upstream_B.xlsx RawData!B2:B9
@@ -148,6 +172,21 @@ def make_model():
     for i, v in enumerate(fx_pasted, 2):
         ws.cell(i, 8, v)  # Column H — hardcoded, no formula
 
+    # --- Section 5: Formulas referencing NON-EXISTENT files ---
+    ws["J1"] = "From Missing File 1"
+    ws["K1"] = "From Missing File 2"
+    ws["L1"] = "From Missing SharePoint"
+    for i in range(2, 10):
+        # Reference a file that does not exist on disk
+        ws.cell(i, 10).value = f"='[ghost_data.xlsx]Revenue'!A{i}*1.1"
+        # Another missing file
+        ws.cell(i, 11).value = f"='[old_budget_2019.xlsx]Forecast'!B{i}"
+        # SharePoint URL that doesn't resolve
+        ws.cell(i, 12).value = (
+            f"='https://corp.sharepoint.com/sites/finance/"
+            f"[quarterly_report.xlsx]Summary'!C{i}"
+        )
+
     path = OUT / "model.xlsx"
     wb.save(path)
     print(f"Created {path}")
@@ -163,3 +202,7 @@ if __name__ == "__main__":
     print("  model.xlsx  -->  upstream_A.xlsx  -->  upstream_B.xlsx")
     print("\nHardcoded vectors in model.xlsx copied from upstream_B.xlsx:")
     print("  F2:F9 = Revenue, G2:G9 = COGS, H2:H9 = FX rates")
+    print("\nFormulas pointing to NON-EXISTENT files:")
+    print("  J2:J9 -> ghost_data.xlsx (missing)")
+    print("  K2:K9 -> old_budget_2019.xlsx (missing)")
+    print("  L2:L9 -> quarterly_report.xlsx on SharePoint (missing)")
