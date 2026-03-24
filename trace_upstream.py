@@ -187,6 +187,10 @@ Examples:
         from lineage.tracing.formula_tracer import trace_formula_levels
 
         search_dirs = [model_path.parent]
+        if args.upstream_dir:
+            ud = Path(args.upstream_dir).resolve()
+            if ud.is_dir() and ud != model_path.parent:
+                search_dirs.append(ud)
         level_refs = trace_formula_levels(
             model_path,
             search_dirs=search_dirs,

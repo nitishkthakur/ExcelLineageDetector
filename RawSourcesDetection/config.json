@@ -1,0 +1,16 @@
+{
+    "model_sheets": [],
+    "max_formula_levels": 5,
+    "matching": {
+        "exact": true,
+        "approximate": false,
+        "exact_decimal_places": 8,
+        "subsequence_matching": true,
+        "min_similarity": 0.85,
+        "similarity_metric": "pearson"
+    },
+    "performance": {
+        "max_workers": null,
+        "min_vector_length": 3
+    }
+}

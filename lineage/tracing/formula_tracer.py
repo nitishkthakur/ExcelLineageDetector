@@ -24,7 +24,7 @@ from urllib.parse import unquote
 
 from lxml import etree
 
-from lineage.hardcoded_scanner import _col_to_idx, _idx_to_col, _CELL_RE, _get_sheet_map
+from lineage.hardcoded_scanner import _col_to_idx, _idx_to_col, _CELL_RE, _get_sheet_map, NS
 
 
 # ---------------------------------------------------------------------------
@@ -80,6 +80,10 @@ class ExternalReference:
     target_path: str       # full path from formula / rels (for display)
     file_found: bool
     resolved_path: str     # actual disk path if found, else expected path
+    # "cell" (default), "named_range", or "table"
+    ref_type: str = "cell"
+    # For named_range/table refs: the original name from the formula.
+    target_name: str | None = None
     # Precedent chain for transitive references (None = direct reference).
     # Each tuple: (sheet_name, cell_ref, formula_snippet).
     precedent_chain: list[tuple[str, str, str]] | None = None
@@ -179,6 +183,45 @@ _REF_RE = re.compile(
 # Regex to capture the full path prefix before [filename] in a formula.
 _PATH_RE = re.compile(
     r"'([^']*?)\[([^\]]+)\]",
+    re.IGNORECASE,
+)
+
+# Quick check: does a string look like a cell reference (e.g. "A1", "XFD1048576")?
+_CELL_LIKE_RE = re.compile(r"^[A-Z]{1,3}\d+$", re.IGNORECASE)
+
+# Regex: captures named range / table references from external workbooks.
+# Handles:  '[file.xlsx]'!NamedRange
+#           [1]!NamedRange
+#           '[file.xlsx]Sheet1'!NamedRange   (sheet-scoped name)
+#           'C:\path\[file.xlsx]'!MyTable
+# Group 1: filename or numeric index
+# Group 2: sheet qualifier (may be empty for workbook-level names)
+# Group 3: the name identifier (letters/digits/underscores, NOT a cell ref)
+_NAMED_REF_RE = re.compile(
+    r"'?"                                   # optional opening quote
+    r"(?:[^'\[\]]*?)"                       # optional path prefix (non-greedy)
+    r"\[([^\]]+)\]"                         # group 1: filename or numeric index
+    r"([^'!]*)"                             # group 2: sheet qualifier (may be empty)
+    r"'?"                                   # optional closing quote
+    r"!"                                    # exclamation separator
+    r"([A-Za-z_][A-Za-z0-9_.]*)",           # group 3: identifier
+    re.IGNORECASE,
+)
+
+# Regex: captures structured table references from external workbooks WITHOUT '!'.
+# Handles:  [file.xlsx]TableName
+#           [file.xlsx]TableName[Column]
+#           '[path\file.xlsx]'TableName
+# Group 1: filename (must contain '.' to distinguish from e.g. [ColumnName])
+# Group 2: table/name identifier
+# Group 3: optional structured column like [Column]
+_STRUCT_TABLE_RE = re.compile(
+    r"'?"
+    r"(?:[^'\[\]]*?)"                       # optional path prefix
+    r"\[([^\]]+\.[^\]]+)\]"                 # group 1: filename (must contain '.')
+    r"'?"                                   # optional closing quote
+    r"([A-Za-z_]\w*)"                       # group 2: identifier (immediately after ])
+    r"(?:\[([^\]]*)\])?",                   # group 3: optional [Column]
     re.IGNORECASE,
 )
 
@@ -480,6 +523,93 @@ def _parse_formula_refs(
     return refs
 
 
+def _parse_formula_named_refs(
+    formula: str,
+    link_map: dict[str, tuple[str, str]],
+) -> list[tuple[str, str, str, str]]:
+    """Parse a formula and return all external named range / table references.
+
+    Returns list of (filename, sheet_qualifier, name, display_path).
+    Only captures identifiers after '!' that do NOT look like cell references
+    (those are already handled by _parse_formula_refs).
+    """
+    # Build exclusion spans from cell-reference matches so we don't double-count
+    cell_spans: list[tuple[int, int]] = []
+    for m in _REF_RE.finditer(formula):
+        cell_spans.append((m.start(), m.end()))
+
+    refs: list[tuple[str, str, str, str]] = []
+    seen: set[tuple[str, str, str]] = set()
+
+    for m in _NAMED_REF_RE.finditer(formula):
+        # Skip if this match overlaps with a cell-reference match
+        mstart, mend = m.start(), m.end()
+        if any(cs <= mstart < ce or cs < mend <= ce for cs, ce in cell_spans):
+            continue
+
+        identifier = m.group(3)
+        # Skip if the identifier looks like a cell reference (e.g. "A1", "XFD999")
+        if _CELL_LIKE_RE.match(identifier):
+            continue
+
+        file_id = m.group(1)
+        qualifier = m.group(2).strip()
+        display_path = ""
+
+        if file_id.isdigit():
+            resolved = link_map.get(file_id)
+            if resolved:
+                filename, display_path = resolved
+            else:
+                filename = f"[ExternalLink{file_id}]"
+                display_path = f"xl/externalLinks/externalLink{file_id}.xml"
+        else:
+            filename = file_id
+            for pm in _PATH_RE.finditer(formula):
+                if pm.group(2) == file_id:
+                    display_path = pm.group(1) + filename
+                    break
+            if not display_path:
+                display_path = filename
+
+        key = (filename.lower(), qualifier.lower(), identifier.lower())
+        if key in seen:
+            continue
+        seen.add(key)
+        refs.append((filename, qualifier, identifier, display_path))
+
+    # ── Structured table refs (no '!' separator) ──
+    # Build all exclusion spans: cell refs + named refs already captured above.
+    all_spans = list(cell_spans)
+    for m in _NAMED_REF_RE.finditer(formula):
+        all_spans.append((m.start(), m.end()))
+
+    for m in _STRUCT_TABLE_RE.finditer(formula):
+        mstart, mend = m.start(), m.end()
+        if any(s <= mstart < e or s < mend <= e for s, e in all_spans):
+            continue
+        # Skip if followed by '!' — it's really a [file]Sheet!Cell pattern
+        if mend < len(formula) and formula[mend] == "!":
+            continue
+        file_id = m.group(1)
+        identifier = m.group(2)
+        if _CELL_LIKE_RE.match(identifier):
+            continue
+        filename = file_id
+        display_path = filename
+        for pm in _PATH_RE.finditer(formula):
+            if pm.group(2) == file_id:
+                display_path = pm.group(1) + filename
+                break
+        key = (filename.lower(), "", identifier.lower())
+        if key in seen:
+            continue
+        seen.add(key)
+        refs.append((filename, "", identifier, display_path))
+
+    return refs
+
+
 # ---------------------------------------------------------------------------
 # Precedent walking (BFS)
 # ---------------------------------------------------------------------------
@@ -493,6 +623,10 @@ class _PrecedentHit:
     chain: list[tuple[str, str, str]]
     # The external refs found at the end of the chain.
     external_refs: list[tuple[str, str, str, str]]  # (filename, sheet, range, display_path)
+    # Named range / table refs found at the end of the chain.
+    named_refs: list[tuple[str, str, str, str]] = field(
+        default_factory=list,
+    )  # (filename, qualifier, name, display_path)
 
 
 def _walk_precedents(
@@ -545,17 +679,21 @@ def _walk_precedents(
         if "[" in formula:
             # Found external reference — record the hit
             ext_refs = _parse_formula_refs(formula, link_map)
-            if ext_refs:
+            named_refs = _parse_formula_named_refs(formula, link_map)
+            if ext_refs or named_refs:
                 full_chain = chain + [(sheet, cell, formula[:200])]
                 hits.append(_PrecedentHit(
                     chain=full_chain,
                     external_refs=ext_refs,
+                    named_refs=named_refs,
                 ))
-            # Don't walk past this cell — the external file's internals
-            # are handled by the next level of trace_formula_levels
-            continue
+            # The external file's internals are handled by the next level
+            # of trace_formula_levels, but this cell may ALSO have intra-
+            # workbook refs that lead to additional external files — keep
+            # walking those.
 
-        # No external ref — walk this cell's precedents
+        # Walk this cell's intra-workbook precedents (whether or not
+        # we already found external refs in this cell's formula).
         intra_refs = _parse_intra_refs(formula, sheet)
         next_chain = chain + [(sheet, cell, formula[:200])]
 
@@ -568,6 +706,251 @@ def _walk_precedents(
                     queue.append((ref_sheet, next_cell_upper, next_chain, depth + 1))
 
     return hits
+
+
+# ---------------------------------------------------------------------------
+# Named range / table resolution from Excel ZIP
+# ---------------------------------------------------------------------------
+
+@dataclass
+class _DefinedNameEntry:
+    """A single defined name entry from workbook.xml."""
+    sheet: str
+    cell_range: str
+    scope_sheet: str | None = None   # None = workbook-level
+    is_dynamic: bool = False         # True if value is a formula, not a range
+
+
+def _get_defined_names(
+    zf: zipfile.ZipFile,
+) -> tuple[dict[str, list[_DefinedNameEntry]], list[tuple[str, str, str, str, str]]]:
+    """Get named ranges from workbook.xml.
+
+    Returns a tuple of:
+      1. Local names: {name_lower: [_DefinedNameEntry, ...]}
+         Multiple entries per name when sheet-scoped versions exist.
+      2. External names: [(name, filename, sheet, cell_range, display_path)]
+         Names whose value references another workbook (contains '[').
+    """
+    local: dict[str, list[_DefinedNameEntry]] = {}
+    external: list[tuple[str, str, str, str, str]] = []
+
+    try:
+        wb_root = etree.fromstring(zf.read("xl/workbook.xml"))
+
+        # Build sheet index → sheet name map (0-based) for localSheetId
+        idx_to_name: dict[int, str] = {}
+        sheet_elems = (
+            wb_root.findall(f".//{{{NS}}}sheet")
+            or wb_root.findall(".//sheet")
+            or wb_root.findall(".//{*}sheet")
+        )
+        for i, sh in enumerate(sheet_elems):
+            idx_to_name[i] = sh.get("name", f"Sheet{i + 1}")
+
+        for dn in (wb_root.findall(f".//{{{NS}}}definedName")
+                   or wb_root.findall(".//definedName")
+                   or wb_root.findall(".//{*}definedName")):
+            name = dn.get("name", "")
+            value = (dn.text or "").strip()
+            if not name or not value:
+                continue
+            if name.startswith("_xlnm"):
+                continue
+
+            # Determine scope
+            scope_sheet: str | None = None
+            local_id = dn.get("localSheetId")
+            if local_id is not None:
+                try:
+                    scope_sheet = idx_to_name.get(int(local_id))
+                except (ValueError, TypeError):
+                    pass
+
+            # External reference: value contains '[' → another workbook
+            if "[" in value:
+                # Parse: value like "'[other.xlsx]Sheet1'!$A$1:$B$10"
+                for m in _REF_RE.finditer(value):
+                    file_id = m.group(1)
+                    sheet = m.group(2).strip()
+                    cell_range = m.group(3).replace("$", "")
+                    external.append((name, file_id, sheet, cell_range, file_id))
+                    break  # first match is enough
+                else:
+                    # Try named ref pattern too
+                    for m in _NAMED_REF_RE.finditer(value):
+                        ident = m.group(3)
+                        if not _CELL_LIKE_RE.match(ident):
+                            external.append((
+                                name, m.group(1), m.group(2).strip(),
+                                ident, m.group(1),
+                            ))
+                            break
+                continue  # don't add to local names
+
+            if "!" not in value:
+                continue
+
+            parts = value.split("!", 1)
+            sheet = parts[0].strip("'").strip("=")
+            cell_range = parts[1].replace("$", "")
+
+            # Dynamic formula detection: cell_range contains '(' → e.g. OFFSET(...)
+            is_dynamic = "(" in cell_range
+
+            local.setdefault(name.lower(), []).append(
+                _DefinedNameEntry(
+                    sheet=sheet,
+                    cell_range=cell_range,
+                    scope_sheet=scope_sheet,
+                    is_dynamic=is_dynamic,
+                )
+            )
+    except Exception:
+        pass
+    return local, external
+
+
+def _get_tables(zf: zipfile.ZipFile) -> dict[str, tuple[str, str]]:
+    """Get table definitions from the workbook.
+
+    Returns {table_name_lower: (sheet_name, cell_range)}.
+    """
+    tables: dict[str, tuple[str, str]] = {}
+    file_names = set(zf.namelist())
+
+    # Build sheet_name → sheet_path mapping
+    sheet_map = _get_sheet_map(zf)
+
+    for sheet_name, sheet_path in sheet_map.items():
+        # The rels file for e.g. xl/worksheets/sheet1.xml is
+        # xl/worksheets/_rels/sheet1.xml.rels
+        sheet_filename = sheet_path.rsplit("/", 1)[-1]
+        rels_path = f"xl/worksheets/_rels/{sheet_filename}.rels"
+        if rels_path not in file_names:
+            continue
+        try:
+            rels_root = etree.fromstring(zf.read(rels_path))
+            for rel in rels_root:
+                target = rel.get("Target", "")
+                rel_type = rel.get("Type", "")
+                if "table" not in rel_type.lower() or not target:
+                    continue
+                # Resolve the target path to a zip entry path.
+                # Absolute:  /xl/tables/table1.xml → xl/tables/table1.xml
+                # Relative:  ../tables/table1.xml  → xl/tables/table1.xml
+                # Bare:      tables/table1.xml     → xl/worksheets/tables/...
+                if target.startswith("/"):
+                    table_path = target.lstrip("/")
+                elif target.startswith(".."):
+                    table_path = f"xl/{target[3:]}"
+                elif not target.startswith("xl/"):
+                    table_path = f"xl/worksheets/{target}"
+                else:
+                    table_path = target
+                table_path = table_path.replace("//", "/")
+                if table_path not in file_names:
+                    continue
+                table_root = etree.fromstring(zf.read(table_path))
+                tbl_name = (table_root.get("displayName")
+                            or table_root.get("name", ""))
+                tbl_ref = table_root.get("ref", "")
+                if tbl_name and tbl_ref:
+                    tables[tbl_name.lower()] = (sheet_name, tbl_ref)
+        except Exception:
+            pass
+
+    return tables
+
+
+@dataclass
+class ResolvedNameResult:
+    """Result of resolving a named range / table in an Excel file."""
+    sheet: str
+    cell_range: str
+    ref_type: str   # "named_range" or "table"
+    is_dynamic: bool = False
+    # If the name redirects to another external workbook:
+    external_file: str | None = None
+    external_sheet: str | None = None
+    external_range: str | None = None
+
+
+def _resolve_named_ref_in_file(
+    path: Path,
+    name: str,
+    qualifier: str = "",
+) -> ResolvedNameResult | None:
+    """Resolve a named range or table name in an Excel file.
+
+    Parameters
+    ----------
+    path : Path to the .xlsx file.
+    name : The identifier to resolve (e.g. "RevenueData", "tbl_inputs").
+    qualifier : Optional sheet qualifier (for sheet-scoped names).
+
+    Returns a ResolvedNameResult, or None if the name cannot be resolved.
+    """
+    try:
+        with zipfile.ZipFile(path) as zf:
+            key = name.lower()
+
+            # ── Defined names ──
+            defined, external_names = _get_defined_names(zf)
+
+            # Check if this name is external (redirects to another workbook)
+            for ename, efile, esheet, erange, edisp in external_names:
+                if ename.lower() == key:
+                    return ResolvedNameResult(
+                        sheet=esheet, cell_range=erange,
+                        ref_type="named_range",
+                        external_file=efile,
+                        external_sheet=esheet,
+                        external_range=erange,
+                    )
+
+            entries = defined.get(key)
+            if entries:
+                # Pick best match: prefer scoped entry matching qualifier
+                best: _DefinedNameEntry | None = None
+                for entry in entries:
+                    if (qualifier
+                            and entry.scope_sheet
+                            and entry.scope_sheet.lower() == qualifier.lower()):
+                        best = entry
+                        break
+                if best is None:
+                    # Prefer global (scope=None) over random scoped
+                    for entry in entries:
+                        if entry.scope_sheet is None:
+                            best = entry
+                            break
+                if best is None:
+                    best = entries[0]
+
+                if best.is_dynamic:
+                    # Dynamic formula — can't resolve statically.
+                    # Return the sheet so the caller can do a full-sheet scan.
+                    return ResolvedNameResult(
+                        sheet=best.sheet, cell_range="",
+                        ref_type="named_range", is_dynamic=True,
+                    )
+                return ResolvedNameResult(
+                    sheet=best.sheet, cell_range=best.cell_range,
+                    ref_type="named_range",
+                )
+
+            # ── Tables ──
+            tables = _get_tables(zf)
+            if key in tables:
+                sheet, cell_range = tables[key]
+                return ResolvedNameResult(
+                    sheet=sheet, cell_range=cell_range, ref_type="table",
+                )
+
+    except Exception:
+        pass
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -619,6 +1002,7 @@ def scan_external_refs(
                         data = zf.read(sheet_path)
                         formulas = _stream_external_formulas(data, sheet_name)
                         for cell_ref, formula in formulas:
+                            # Cell references
                             parsed = _parse_formula_refs(formula, link_map)
                             for filename, tgt_sheet, tgt_range, display_path in parsed:
                                 resolved, found = _resolve_file(filename, search)
@@ -634,6 +1018,26 @@ def scan_external_refs(
                                     target_path=display_path,
                                     file_found=found,
                                     resolved_path=str(resolved),
+                                    precedent_chain=None,
+                                ))
+                            # Named range / table references
+                            named = _parse_formula_named_refs(formula, link_map)
+                            for filename, qualifier, name, display_path in named:
+                                resolved, found = _resolve_file(filename, search)
+                                refs.append(ExternalReference(
+                                    level=level,
+                                    source_file=source_file,
+                                    source_sheet=sheet_name,
+                                    source_cell=cell_ref,
+                                    formula=formula[:300],
+                                    target_file=filename,
+                                    target_sheet=qualifier,
+                                    target_range=name,
+                                    target_path=display_path,
+                                    file_found=found,
+                                    resolved_path=str(resolved),
+                                    ref_type="named_ref",
+                                    target_name=name,
                                     precedent_chain=None,
                                 ))
                     except Exception:
@@ -659,7 +1063,7 @@ def scan_external_refs(
                             continue
 
                         if "[" in formula:
-                            # Direct external reference
+                            # Direct external reference — cell refs
                             parsed = _parse_formula_refs(formula, link_map)
                             for filename, tgt_sheet, tgt_range, display_path in parsed:
                                 resolved, found = _resolve_file(filename, search)
@@ -675,6 +1079,26 @@ def scan_external_refs(
                                     target_path=display_path,
                                     file_found=found,
                                     resolved_path=str(resolved),
+                                    precedent_chain=None,
+                                ))
+                            # Direct external reference — named refs
+                            named = _parse_formula_named_refs(formula, link_map)
+                            for filename, qualifier, name, display_path in named:
+                                resolved, found = _resolve_file(filename, search)
+                                refs.append(ExternalReference(
+                                    level=level,
+                                    source_file=source_file,
+                                    source_sheet=sheet_name,
+                                    source_cell=cell_ref,
+                                    formula=formula[:300],
+                                    target_file=filename,
+                                    target_sheet=qualifier,
+                                    target_range=name,
+                                    target_path=display_path,
+                                    file_found=found,
+                                    resolved_path=str(resolved),
+                                    ref_type="named_ref",
+                                    target_name=name,
                                     precedent_chain=None,
                                 ))
                         else:
@@ -700,6 +1124,24 @@ def scan_external_refs(
                                         resolved_path=str(resolved),
                                         precedent_chain=hit.chain,
                                     ))
+                                for filename, qualifier, name, display_path in hit.named_refs:
+                                    resolved, found = _resolve_file(filename, search)
+                                    refs.append(ExternalReference(
+                                        level=level,
+                                        source_file=source_file,
+                                        source_sheet=sheet_name,
+                                        source_cell=cell_ref,
+                                        formula=formula[:300],
+                                        target_file=filename,
+                                        target_sheet=qualifier,
+                                        target_range=name,
+                                        target_path=display_path,
+                                        file_found=found,
+                                        resolved_path=str(resolved),
+                                        ref_type="named_ref",
+                                        target_name=name,
+                                        precedent_chain=hit.chain,
+                                    ))
 
     except zipfile.BadZipFile:
         pass
@@ -710,23 +1152,46 @@ def scan_external_refs(
 
 
 def _resolve_file(filename: str, search_dirs: list[Path]) -> tuple[Path, bool]:
-    """Find a file by name in the search directories.
+    """Find a file by name in the search directories (recursive).
+
+    The file might have been created on a different computer with a different
+    path.  We strip any directory prefix (Windows or Unix) and search by
+    basename only, first as direct children, then recursively.
 
     Returns (path, found). If not found, returns the first candidate path.
     """
+    # Strip any path prefix — we only care about the basename.
+    # Handles Windows paths like "C:\\Users\\data\\budget.xlsx" and
+    # Unix paths, file:// URLs, etc.
+    bare = filename.rsplit("/", 1)[-1].rsplit("\\", 1)[-1]
+    if bare:
+        filename = bare
+    fn_lower = filename.lower()
+
+    # Phase 1: direct child (fast path)
     for d in search_dirs:
         candidate = d / filename
         if candidate.exists():
             return candidate.resolve(), True
 
-    # Case-insensitive fallback
-    fn_lower = filename.lower()
+    # Phase 2: case-insensitive direct child
     for d in search_dirs:
         if not d.is_dir():
             continue
         try:
             for p in d.iterdir():
-                if p.name.lower() == fn_lower:
+                if p.is_file() and p.name.lower() == fn_lower:
+                    return p.resolve(), True
+        except Exception:
+            pass
+
+    # Phase 3: recursive subdirectory search
+    for d in search_dirs:
+        if not d.is_dir():
+            continue
+        try:
+            for p in d.rglob("*"):
+                if p.is_file() and p.name.lower() == fn_lower:
                     return p.resolve(), True
         except Exception:
             pass
@@ -789,6 +1254,8 @@ def trace_formula_levels(
         # Group by target file: filename → [(target_sheet, target_range)]
         targets: dict[str, list[tuple[str, str]]] = {}
         target_paths: dict[str, Path] = {}
+        # Files where a named ref couldn't be resolved → scan entire file
+        full_scan_files: set[str] = set()
 
         for ref in prev_refs:
             if not ref.file_found:
@@ -796,10 +1263,78 @@ def trace_formula_levels(
             fn_lower = ref.target_file.lower()
             if fn_lower in visited_files:
                 continue  # avoid cycles
-            targets.setdefault(ref.target_file, []).append(
-                (ref.target_sheet, ref.target_range),
-            )
+
             target_paths[ref.target_file] = Path(ref.resolved_path)
+
+            if ref.ref_type == "named_ref" and ref.target_name:
+                # Resolve named range / table in the target file
+                resolved_name = _resolve_named_ref_in_file(
+                    Path(ref.resolved_path),
+                    ref.target_name,
+                    qualifier=ref.target_sheet,
+                )
+                if resolved_name and resolved_name.external_file:
+                    # Name redirects to yet another workbook — add as a
+                    # new external reference at this level instead of
+                    # scoping into the current file.
+                    ext_fn = resolved_name.external_file
+                    ext_resolved, ext_found = _resolve_file(
+                        ext_fn, search_dirs,
+                    )
+                    level_refs_extra = level_refs  # will be populated below
+                    # We'll inject this after the scanning loop below.
+                    # For now, record it so the scanning loop processes it.
+                    targets.setdefault(ref.target_file, [])
+                    # Update ref for display
+                    ref.target_sheet = resolved_name.external_sheet or ""
+                    ref.target_range = (
+                        f"{ref.target_name} \u2192 "
+                        f"[{ext_fn}]{resolved_name.external_sheet}!"
+                        f"{resolved_name.external_range}"
+                    )
+                    ref.ref_type = "named_range"
+                    # Also add the redirect target as a new ref at this level
+                    # so it gets traced at the next level.
+                    results.setdefault(level, []).append(ExternalReference(
+                        level=level,
+                        source_file=ref.target_file,
+                        source_sheet="",
+                        source_cell=f"(definedName:{ref.target_name})",
+                        formula=f"definedName={ref.target_name}",
+                        target_file=ext_fn,
+                        target_sheet=resolved_name.external_sheet or "",
+                        target_range=resolved_name.external_range or "",
+                        target_path=ext_fn,
+                        file_found=ext_found,
+                        resolved_path=str(ext_resolved),
+                        ref_type="named_range",
+                        target_name=ref.target_name,
+                    ))
+                elif resolved_name and resolved_name.is_dynamic:
+                    # Dynamic formula name — scan the target sheet fully
+                    full_scan_files.add(ref.target_file)
+                    targets.setdefault(ref.target_file, [])
+                    ref.target_sheet = resolved_name.sheet
+                    ref.target_range = f"{ref.target_name} (dynamic)"
+                    ref.ref_type = resolved_name.ref_type
+                elif resolved_name:
+                    targets.setdefault(ref.target_file, []).append(
+                        (resolved_name.sheet, resolved_name.cell_range),
+                    )
+                    ref.target_sheet = resolved_name.sheet
+                    ref.target_range = (
+                        f"{ref.target_name} \u2192 "
+                        f"{resolved_name.cell_range}"
+                    )
+                    ref.ref_type = resolved_name.ref_type
+                else:
+                    # Can't resolve — fall back to scanning entire file
+                    full_scan_files.add(ref.target_file)
+                    targets.setdefault(ref.target_file, [])
+            else:
+                targets.setdefault(ref.target_file, []).append(
+                    (ref.target_sheet, ref.target_range),
+                )
 
         if not targets:
             break
@@ -810,14 +1345,22 @@ def trace_formula_levels(
             file_path = target_paths[filename]
             visited_files.add(filename.lower())
 
-            # Build cell filter from the cell specs referenced at the previous level
-            cell_filter = CellFilter.from_refs(cell_specs)
+            # If any named ref for this file couldn't be resolved,
+            # or there are no cell specs, scan the entire file.
+            if filename in full_scan_files or not cell_specs:
+                cell_filter = None
+            else:
+                cell_filter = CellFilter.from_refs(cell_specs)
 
             if verbose:
-                n_sheets = len(cell_filter.ranges)
-                n_rects = sum(len(r) for r in cell_filter.ranges.values())
-                print(f"  Level {level}: scanning {filename} "
-                      f"({n_sheets} sheet(s), {n_rects} range(s)) ...")
+                if cell_filter is None:
+                    print(f"  Level {level}: scanning {filename} "
+                          f"(full file — named ref fallback) ...")
+                else:
+                    n_sheets = len(cell_filter.ranges)
+                    n_rects = sum(len(r) for r in cell_filter.ranges.values())
+                    print(f"  Level {level}: scanning {filename} "
+                          f"({n_sheets} sheet(s), {n_rects} range(s)) ...")
 
             file_refs = scan_external_refs(
                 file_path, filename, level=level,
@@ -825,6 +1368,10 @@ def trace_formula_levels(
                 search_dirs=search_dirs,
             )
             level_refs.extend(file_refs)
+
+        # Merge any external-redirect refs pre-added during name resolution
+        if level in results:
+            level_refs.extend(results[level])
 
         if not level_refs:
             if verbose:

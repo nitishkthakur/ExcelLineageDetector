@@ -1210,3 +1210,363 @@ def test_report_with_precedent_chain():
 
         # Row 3: direct ref — should show "(direct)"
         assert ws.cell(row=3, column=11).value == "(direct)"
+
+
+# ---------------------------------------------------------------------------
+# Gap 1: Structured table references (no '!' separator)
+# ---------------------------------------------------------------------------
+
+def test_parse_named_refs_struct_table():
+    """Structured table refs like [file.xlsx]Table[Col] are captured."""
+    from lineage.tracing.formula_tracer import _parse_formula_named_refs
+    refs = _parse_formula_named_refs("[data.xlsx]MyTable[Revenue]", {})
+    assert len(refs) == 1
+    assert refs[0] == ("data.xlsx", "", "MyTable", "data.xlsx")
+
+
+def test_parse_named_refs_struct_table_no_column():
+    """[file.xlsx]TableName without column specifier is captured."""
+    from lineage.tracing.formula_tracer import _parse_formula_named_refs
+    refs = _parse_formula_named_refs("[data.xlsx]Financials", {})
+    assert len(refs) == 1
+    assert refs[0][2] == "Financials"
+
+
+def test_struct_table_does_not_match_cell_ref():
+    """[file.xlsx]Sheet1!A1 is NOT captured as a struct table ref."""
+    from lineage.tracing.formula_tracer import _parse_formula_named_refs
+    refs = _parse_formula_named_refs("'[data.xlsx]Sheet1'!A1", {})
+    assert len(refs) == 0
+
+
+def test_parse_named_refs_with_bang():
+    """Named refs with '!' like '[file.xlsx]'!MyRange are captured."""
+    from lineage.tracing.formula_tracer import _parse_formula_named_refs
+    refs = _parse_formula_named_refs("='[data.xlsx]'!MyRange", {})
+    assert len(refs) == 1
+    assert refs[0] == ("data.xlsx", "", "MyRange", "data.xlsx")
+
+
+def test_parse_named_refs_sheet_qualified():
+    """Sheet-qualified named ref '[file.xlsx]Sheet1'!Name is captured."""
+    from lineage.tracing.formula_tracer import _parse_formula_named_refs
+    refs = _parse_formula_named_refs("'[data.xlsx]Sheet1'!TotalRevenue", {})
+    assert len(refs) == 1
+    assert refs[0][1] == "Sheet1"
+    assert refs[0][2] == "TotalRevenue"
+
+
+# ---------------------------------------------------------------------------
+# Gap 2: Sheet-scoped named ranges
+# ---------------------------------------------------------------------------
+
+def _make_xlsx_with_custom_defined_names(defined_names_xml: bytes) -> Path:
+    """Helper: create an xlsx with custom <definedNames> in workbook.xml."""
+    import openpyxl
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "Sheet1"
+    wb.create_sheet("Sheet2")
+    ws["A1"] = 1
+    f = tempfile.NamedTemporaryFile(suffix=".xlsx", delete=False)
+    wb.save(f.name)
+    f.close()
+    src = Path(f.name)
+    patched = Path(f.name + ".p.xlsx")
+    with zipfile.ZipFile(src, "r") as zin, zipfile.ZipFile(patched, "w") as zout:
+        for item in zin.namelist():
+            data = zin.read(item)
+            if item == "xl/workbook.xml":
+                # Replace empty definedNames or inject before </workbook>
+                if b"<definedNames/>" in data:
+                    data = data.replace(b"<definedNames/>", defined_names_xml)
+                elif b"<definedNames>" in data:
+                    # Replace existing block
+                    data = re.sub(
+                        rb"<definedNames>.*?</definedNames>",
+                        defined_names_xml,
+                        data,
+                        flags=re.DOTALL,
+                    )
+                else:
+                    data = data.replace(b"</workbook>", defined_names_xml + b"</workbook>")
+            zout.writestr(item, data)
+    src.unlink()
+    return patched
+
+
+def test_get_defined_names_scoped():
+    """_get_defined_names returns scope info for localSheetId names."""
+    from lineage.tracing.formula_tracer import _get_defined_names
+    xml = (
+        b'<definedNames>'
+        b'<definedName name="Revenue">Sheet1!$A$1:$B$10</definedName>'
+        b'<definedName name="Revenue" localSheetId="1">Sheet2!$C$1:$D$5</definedName>'
+        b'</definedNames>'
+    )
+    path = _make_xlsx_with_custom_defined_names(xml)
+    try:
+        with zipfile.ZipFile(path) as zf:
+            local, _ = _get_defined_names(zf)
+        entries = local.get("revenue", [])
+        assert len(entries) == 2
+        global_e = [e for e in entries if e.scope_sheet is None]
+        scoped_e = [e for e in entries if e.scope_sheet is not None]
+        assert len(global_e) == 1
+        assert global_e[0].sheet == "Sheet1"
+        assert len(scoped_e) == 1
+        assert scoped_e[0].scope_sheet == "Sheet2"
+        assert scoped_e[0].cell_range == "C1:D5"
+    finally:
+        path.unlink()
+
+
+def test_resolve_named_ref_prefers_scoped():
+    """Resolver picks scoped entry when qualifier matches."""
+    from lineage.tracing.formula_tracer import _resolve_named_ref_in_file
+    xml = (
+        b'<definedNames>'
+        b'<definedName name="Data">Sheet1!$A$1:$A$10</definedName>'
+        b'<definedName name="Data" localSheetId="1">Sheet2!$C$1:$C$20</definedName>'
+        b'</definedNames>'
+    )
+    path = _make_xlsx_with_custom_defined_names(xml)
+    try:
+        # With qualifier matching scoped entry
+        r = _resolve_named_ref_in_file(path, "Data", qualifier="Sheet2")
+        assert r is not None
+        assert r.sheet == "Sheet2"
+        assert r.cell_range == "C1:C20"
+
+        # Without qualifier → global
+        r = _resolve_named_ref_in_file(path, "Data", qualifier="")
+        assert r is not None
+        assert r.sheet == "Sheet1"
+    finally:
+        path.unlink()
+
+
+# ---------------------------------------------------------------------------
+# Gap 3: Dynamic named ranges
+# ---------------------------------------------------------------------------
+
+def test_get_defined_names_dynamic():
+    """Dynamic named ranges (with formulas) are flagged as is_dynamic."""
+    from lineage.tracing.formula_tracer import _get_defined_names
+    xml = (
+        b'<definedNames>'
+        b'<definedName name="DynRange">Sheet1!OFFSET($A$1,0,0,COUNTA($A:$A),1)</definedName>'
+        b'<definedName name="StaticRange">Sheet1!$A$1:$B$5</definedName>'
+        b'</definedNames>'
+    )
+    path = _make_xlsx_with_custom_defined_names(xml)
+    try:
+        with zipfile.ZipFile(path) as zf:
+            local, _ = _get_defined_names(zf)
+        dyn = local.get("dynrange", [])
+        assert len(dyn) == 1
+        assert dyn[0].is_dynamic is True
+
+        static = local.get("staticrange", [])
+        assert len(static) == 1
+        assert static[0].is_dynamic is False
+    finally:
+        path.unlink()
+
+
+def test_resolve_dynamic_range():
+    """Resolving a dynamic name returns is_dynamic=True with empty cell_range."""
+    from lineage.tracing.formula_tracer import _resolve_named_ref_in_file
+    xml = (
+        b'<definedNames>'
+        b'<definedName name="Dyn">Sheet1!OFFSET($A$1,0,0,10,1)</definedName>'
+        b'</definedNames>'
+    )
+    path = _make_xlsx_with_custom_defined_names(xml)
+    try:
+        r = _resolve_named_ref_in_file(path, "Dyn")
+        assert r is not None
+        assert r.is_dynamic is True
+        assert r.sheet == "Sheet1"
+        assert r.cell_range == ""  # can't statically resolve
+    finally:
+        path.unlink()
+
+
+# ---------------------------------------------------------------------------
+# Gap 4: Named ranges referencing external workbooks
+# ---------------------------------------------------------------------------
+
+def test_get_defined_names_external():
+    """Names referencing external workbooks are returned in the external list."""
+    from lineage.tracing.formula_tracer import _get_defined_names
+    xml = (
+        b"<definedNames>"
+        b"<definedName name=\"ExtData\">'[other.xlsx]Raw'!$A$1:$C$100</definedName>"
+        b"<definedName name=\"Local\">Sheet1!$A$1:$A$5</definedName>"
+        b"</definedNames>"
+    )
+    path = _make_xlsx_with_custom_defined_names(xml)
+    try:
+        with zipfile.ZipFile(path) as zf:
+            local, external = _get_defined_names(zf)
+        # ExtData should be in external, not local
+        assert "extdata" not in local
+        assert len(external) == 1
+        assert external[0][0] == "ExtData"
+        assert external[0][1] == "other.xlsx"
+        assert external[0][2] == "Raw"
+        # Local should still be there
+        assert "local" in local
+    finally:
+        path.unlink()
+
+
+def test_resolve_external_defined_name():
+    """Resolving an external-redirect name returns external_file info."""
+    from lineage.tracing.formula_tracer import _resolve_named_ref_in_file
+    xml = (
+        b"<definedNames>"
+        b"<definedName name=\"Budget\">'[budget.xlsx]Plan'!$A$1:$D$50</definedName>"
+        b"</definedNames>"
+    )
+    path = _make_xlsx_with_custom_defined_names(xml)
+    try:
+        r = _resolve_named_ref_in_file(path, "Budget")
+        assert r is not None
+        assert r.external_file == "budget.xlsx"
+        assert r.external_sheet == "Plan"
+        assert r.external_range == "A1:D50"
+    finally:
+        path.unlink()
+
+
+# ---------------------------------------------------------------------------
+# Gap 5: Recursive file resolution + path stripping
+# ---------------------------------------------------------------------------
+
+def test_resolve_file_recursive(tmp_path):
+    """_resolve_file finds files in subdirectories recursively."""
+    from lineage.tracing.formula_tracer import _resolve_file
+    sub = tmp_path / "a" / "b" / "c"
+    sub.mkdir(parents=True)
+    (sub / "deep.xlsx").write_bytes(b"fake")
+
+    resolved, found = _resolve_file("deep.xlsx", [tmp_path])
+    assert found
+    assert resolved.name == "deep.xlsx"
+
+
+def test_resolve_file_strips_windows_path(tmp_path):
+    """_resolve_file strips Windows path prefix to find by basename."""
+    from lineage.tracing.formula_tracer import _resolve_file
+    (tmp_path / "budget.xlsx").write_bytes(b"fake")
+
+    resolved, found = _resolve_file(
+        "C:\\Users\\John\\Documents\\budget.xlsx", [tmp_path],
+    )
+    assert found
+    assert resolved.name == "budget.xlsx"
+
+
+def test_resolve_file_strips_unix_path(tmp_path):
+    """_resolve_file strips Unix path prefix to find by basename."""
+    from lineage.tracing.formula_tracer import _resolve_file
+    (tmp_path / "data.xlsx").write_bytes(b"fake")
+
+    resolved, found = _resolve_file("/home/user/docs/data.xlsx", [tmp_path])
+    assert found
+    assert resolved.name == "data.xlsx"
+
+
+def test_resolve_file_case_insensitive_recursive(tmp_path):
+    """Case-insensitive recursive search works."""
+    from lineage.tracing.formula_tracer import _resolve_file
+    sub = tmp_path / "sub"
+    sub.mkdir()
+    (sub / "Budget.xlsx").write_bytes(b"fake")
+
+    resolved, found = _resolve_file("budget.xlsx", [tmp_path])
+    assert found
+    assert resolved.name == "Budget.xlsx"
+
+
+# ---------------------------------------------------------------------------
+# Gap 6: Table resolution
+# ---------------------------------------------------------------------------
+
+def test_resolve_table_in_file():
+    """_resolve_named_ref_in_file resolves Excel table names."""
+    import openpyxl
+    from openpyxl.worksheet.table import Table, TableStyleInfo
+    from lineage.tracing.formula_tracer import _resolve_named_ref_in_file
+
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "Data"
+    ws["A1"] = "Name"
+    ws["B1"] = "Value"
+    ws["A2"] = "x"
+    ws["B2"] = 1
+    tab = Table(displayName="tbl_data", ref="A1:B2")
+    tab.tableStyleInfo = TableStyleInfo(name="TableStyleMedium9")
+    ws.add_table(tab)
+
+    with tempfile.NamedTemporaryFile(suffix=".xlsx", delete=False) as f:
+        wb.save(f.name)
+        path = Path(f.name)
+    try:
+        r = _resolve_named_ref_in_file(path, "tbl_data")
+        assert r is not None
+        assert r.ref_type == "table"
+        assert r.sheet == "Data"
+        assert r.cell_range == "A1:B2"
+    finally:
+        path.unlink()
+
+
+# ---------------------------------------------------------------------------
+# Integration: named ref in formula tracing
+# ---------------------------------------------------------------------------
+
+def test_scan_external_refs_named_ref():
+    """scan_external_refs detects named range references in formulas."""
+    import openpyxl
+    from lineage.tracing.formula_tracer import scan_external_refs
+
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "Model"
+    # Formula referencing a named range in an external file
+    ws["A1"] = 1  # placeholder
+    # We need to inject the formula via XML since openpyxl won't allow external refs
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp = Path(tmp)
+        model = tmp / "model.xlsx"
+        wb.save(str(model))
+
+        # Patch sheet XML to have an external named ref formula
+        with zipfile.ZipFile(model, "r") as zin:
+            names = zin.namelist()
+            sheet_path = [n for n in names if n.startswith("xl/worksheets/sheet")][0]
+            sheet_xml = zin.read(sheet_path)
+
+        # Inject a formula with [file]!NamedRange
+        sheet_xml = sheet_xml.replace(
+            b"<v>1</v>",
+            b'<f>\'[upstream.xlsx]\'!TotalRevenue</f><v>1</v>',
+        )
+
+        patched = tmp / "model_patched.xlsx"
+        with zipfile.ZipFile(model, "r") as zin, zipfile.ZipFile(patched, "w") as zout:
+            for item in zin.namelist():
+                if item == sheet_path:
+                    zout.writestr(item, sheet_xml)
+                else:
+                    zout.writestr(item, zin.read(item))
+
+        refs = scan_external_refs(patched, "model.xlsx", level=1, search_dirs=[tmp])
+        named = [r for r in refs if r.ref_type == "named_ref"]
+        assert len(named) >= 1
+        assert named[0].target_file == "upstream.xlsx"
+        assert named[0].target_name == "TotalRevenue"

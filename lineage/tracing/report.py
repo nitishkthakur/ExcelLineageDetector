@@ -301,6 +301,14 @@ class TracingReporter:
             matches, unmatched, hdr_fill, hdr_font, hdr_align, hdr_border, border,
         )
 
+        # ── Upstream Sources summary sheet ─────────────────────────────
+        ws_sources = wb.create_sheet("Upstream Sources")
+        self._write_sources_sheet(
+            ws_sources, matches, level_refs,
+            model_path,
+            hdr_fill, hdr_font, hdr_align, hdr_border, border, get_column_letter,
+        )
+
         # ── Tracing Results sheet (only if we have value-tracing data) ─
         if matches or unmatched:
             ws_res = wb.create_sheet("Tracing Results")
@@ -354,6 +362,8 @@ class TracingReporter:
             "File Found",        # I
             "Resolved Path",     # J
             "Precedent Chain",   # K
+            "Ref Type",          # L
+            "Target Name",       # M
         ]
 
         # Header row
@@ -383,6 +393,8 @@ class TracingReporter:
                 "Yes" if ref.file_found else "No",
                 ref.resolved_path,
                 self._fmt_chain(ref.precedent_chain),
+                ref.ref_type,
+                ref.target_name or "",
             ]
             for ci, value in enumerate(row_data, 1):
                 cell = ws.cell(row=ri, column=ci, value=value)
@@ -394,9 +406,160 @@ class TracingReporter:
         widths = {
             "A": 24, "B": 20, "C": 10, "D": 60, "E": 24,
             "F": 20, "G": 14, "H": 50, "I": 10, "J": 50, "K": 60,
+            "L": 14, "M": 24,
         }
         for col, w in widths.items():
             ws.column_dimensions[col].width = w
+
+    # ------------------------------------------------------------------ #
+    # Upstream Sources summary sheet
+    # ------------------------------------------------------------------ #
+
+    def _write_sources_sheet(
+        self, ws, matches, level_refs, model_path,
+        hdr_fill, hdr_font, hdr_align, hdr_border, border, get_column_letter,
+    ):
+        """Write a consolidated 'Upstream Sources' sheet.
+
+        Gathers all unique upstream sources from:
+        - Value-based matching (exact/approximate)
+        - Formula tracing (all levels — already scoped to the selected sheet)
+
+        Each row is a unique source with a 'File on Disk' status column.
+        Only includes ancestors that feed the user-selected model sheet.
+        """
+        from openpyxl.styles import PatternFill, Font, Alignment
+
+        headers = [
+            "Source Name",           # A — filename, connection name, or URL
+            "Source Type",           # B — value_match | formula_level_N | oledb | odbc | powerquery | ...
+            "Category",             # C — file | database | web | powerquery | ...
+            "Details",              # D — sheet, range, connection string snippet, etc.
+            "Location in Model",    # E — where in the model this reference was found
+            "File on Disk",         # F — Yes / No / N/A
+        ]
+
+        for ci, h in enumerate(headers, 1):
+            cell = ws.cell(row=1, column=ci, value=h)
+            cell.fill = hdr_fill
+            cell.font = hdr_font
+            cell.alignment = hdr_align
+            cell.border = hdr_border
+        ws.row_dimensions[1].height = 22
+        ws.freeze_panes = "A2"
+
+        found_fill = PatternFill("solid", fgColor=_FOUND_FILL)
+        missing_fill = PatternFill("solid", fgColor=_MISSING_FILL)
+        na_fill = PatternFill("solid", fgColor=_ALT_TINT)
+
+        # Collect rows: list of (name, source_type, category, details, location, file_on_disk)
+        # file_on_disk: True, False, or None (N/A for databases/web)
+        rows: list[tuple[str, str, str, str, str, bool | None]] = []
+        seen_keys: set[str] = set()  # dedup key
+
+        # ── 1. Value-based matches ────────────────────────────────────
+        if matches:
+            # Group by upstream file to show one row per file with best match type
+            file_info: dict[str, tuple[str, list[str], list[str]]] = {}
+            for m in matches:
+                if not m.match_type.startswith("exact") and m.match_type != "approximate":
+                    continue
+                fn = m.upstream_file
+                if fn not in file_info:
+                    file_info[fn] = (m.match_type, [], [])
+                _, sheets, ranges = file_info[fn]
+                if m.upstream_sheet not in sheets:
+                    sheets.append(m.upstream_sheet)
+                if m.model_range not in ranges:
+                    ranges.append(m.model_range)
+                # Prefer exact over approximate
+                if m.match_type.startswith("exact") and not file_info[fn][0].startswith("exact"):
+                    file_info[fn] = (m.match_type, sheets, ranges)
+
+            for fn, (match_type, sheets, model_ranges) in file_info.items():
+                key = f"value|{fn}"
+                if key in seen_keys:
+                    continue
+                seen_keys.add(key)
+                file_found = self._check_file_exists(fn, model_path.parent)
+                rows.append((
+                    fn,
+                    f"value_match ({match_type})",
+                    "file",
+                    f"Sheet(s): {', '.join(sheets)}",
+                    f"Model range(s): {', '.join(model_ranges[:5])}",
+                    file_found,
+                ))
+
+        # ── 2. Formula tracing refs (all levels) ─────────────────────
+        if level_refs:
+            for level in sorted(level_refs.keys()):
+                # Group by target file for this level
+                level_files: dict[str, tuple[bool, list[str], str]] = {}
+                for ref in level_refs[level]:
+                    fn = ref.target_file
+                    if fn not in level_files:
+                        level_files[fn] = (ref.file_found, [], ref.source_file)
+                    _, sheets, _ = level_files[fn]
+                    if ref.target_sheet not in sheets:
+                        sheets.append(ref.target_sheet)
+
+                for fn, (file_found, sheets, src_file) in level_files.items():
+                    key = f"formula|{fn}"
+                    if key in seen_keys:
+                        continue
+                    seen_keys.add(key)
+                    rows.append((
+                        fn,
+                        f"formula_level_{level}",
+                        "file",
+                        f"Sheet(s): {', '.join(sheets)}",
+                        f"Referenced from {src_file}",
+                        file_found,
+                    ))
+
+        # ── Write rows ────────────────────────────────────────────────
+        for ri, (name, src_type, category, details, location, on_disk) in enumerate(rows, 2):
+            if on_disk is True:
+                fill = found_fill
+                disk_str = "Yes"
+            elif on_disk is False:
+                fill = missing_fill
+                disk_str = "No"
+            else:
+                fill = na_fill
+                disk_str = "N/A"
+
+            row_data = [name, src_type, category, details, location, disk_str]
+            for ci, value in enumerate(row_data, 1):
+                cell = ws.cell(row=ri, column=ci, value=value)
+                cell.fill = fill
+                cell.border = border
+
+        # Column widths and auto-filter
+        ws.auto_filter.ref = f"A1:{get_column_letter(len(headers))}1"
+        widths = {"A": 30, "B": 22, "C": 14, "D": 60, "E": 30, "F": 12}
+        for col, w in widths.items():
+            ws.column_dimensions[col].width = w
+
+    @staticmethod
+    def _check_file_exists(name_or_path: str, search_dir: Path) -> bool:
+        """Check if a file exists on disk by name or path."""
+        from pathlib import Path as P
+        p = P(name_or_path)
+        if p.is_absolute() and p.exists():
+            return True
+        candidate = search_dir / p.name
+        if candidate.exists():
+            return True
+        # Case-insensitive fallback
+        try:
+            for f in search_dir.iterdir():
+                if f.name.lower() == p.name.lower():
+                    return True
+        except Exception:
+            pass
+        return False
 
     # ------------------------------------------------------------------ #
     # Colour helpers
