@@ -166,3 +166,120 @@ trace_upstream_mermaid.py (CLI — post-processing)
 - Exact: batched `sliding_window_view` on 2D arrays + vectorized `==` comparison
 - Approximate: single matrix multiply per length bucket (batch Pearson correlation)
 - Benchmark: 91 model vectors × 3196 upstream vectors = **~0.9s total** (including scan + match + report)
+
+## RawSourcesDetection (`RawSourcesDetection/`)
+
+A standalone pipeline tool that comprehensively documents **everything required to run a model** — formula-linked files, ODBC/OLE DB/Power Query connections, copy-pasted vectors without a traced source, and several categories of invisible dependencies that static formula analysis misses.
+
+Place the model file in `RawSourcesDetection/model/` and upstream input files in `RawSourcesDetection/inputs/`. Output goes to `RawSourcesDetection/output/`.
+
+```bash
+# From the repo root:
+.venv/bin/python RawSourcesDetection/detect_sources.py model.xlsx --sheets "Sheet1,Inputs"
+.venv/bin/python RawSourcesDetection/detect_sources.py model.xlsx --sheets "Inputs" --verbose
+.venv/bin/python RawSourcesDetection/detect_sources.py path/to/model.xlsx \
+    --sheets "Sheet1,Assumptions" \
+    --inputs-dir ./inputs \
+    --config RawSourcesDetection/config.json \
+    --out-dir ./output \
+    --max-levels 3 \
+    --approximate \
+    --verbose
+```
+
+**Data flow:**
+```
+detect_sources.py (CLI)
+  → RSDConfig.from_file()                # RawSourcesDetection/pipeline/config.py
+  → run()                                # pipeline/orchestrator.py
+      → Step 1: _trace_formulas()        # recursive BFS, reuses scan_external_refs()
+      → Step 2: _match_vectors()         # reuses UpstreamTracer (numpy exact/approx)
+      → Step 3: _harvest_connections()   # reuses ExcelLineageDetector (ODBC/PQ/etc.)
+      → Step 4: _run_extra_scanners()    # pipeline/extra_scanners.py
+  → write_report()                       # pipeline/report_writer.py → 9-sheet xlsx
+```
+
+**Key modules:**
+
+| Module | Purpose |
+|--------|---------|
+| `pipeline/config.py` | `RSDConfig` dataclass + JSON loader + `to_trace_config()` converter |
+| `pipeline/models.py` | All result dataclasses (see below) |
+| `pipeline/orchestrator.py` | 4-step pipeline: formula tracing → vector matching → connection harvest → extra scanners |
+| `pipeline/extra_scanners.py` | Supplementary gap scanners (8 functions) |
+| `pipeline/report_writer.py` | 9-sheet Excel report writer |
+
+**Pipeline steps:**
+
+1. **Formula tracing** — BFS over external workbook references. Level 1 scoped to user-specified `--sheets`; Level 2+ scans all sheets of each found upstream file. Uses `scan_external_refs()` from `lineage/tracing/formula_tracer.py`. Stops at `max_formula_levels` or when no new files are found. Missing files accumulate with sheets-needed and cell-locations.
+
+2. **Vector matching** — Detects hardcoded numeric vectors in model sheets and matches them (exact / approximate) against all found input files. Delegates entirely to `UpstreamTracer` (numpy batched exact + optional Pearson/cosine/Euclidean approximate). Scoped to `--sheets` only.
+
+3. **Connection harvesting** — Runs `ExcelLineageDetector` on model + all found input files to extract ODBC, OLE DB, Power Query, file references, hyperlinks, VBA connections, etc. Deduplicated by `(connection_string|sub_type|source_file)`.
+
+4. **Extra scanners** — Runs supplementary gap detection on all files:
+   - `scan_dynamic_indirect_refs()` — INDIRECT formulas where the filename is assembled at runtime from cell values (e.g. `=INDIRECT("'["&A1&"]Sheet1'!A1")`). These are invisible to static analysis.
+   - `scan_rtd_refs()` — RTD live COM feed calls (Bloomberg, Reuters, etc.) — not file dependencies.
+   - `scan_chart_external_refs()` — `<f>` elements in `xl/charts/*.xml` referencing external workbooks; merged into formula_refs.
+   - `scan_data_validation_refs()` — `<dataValidation><formula1>` elements pointing to external list sources; merged into formula_refs.
+   - `detect_phantom_links()` — `xl/externalLinks/` entries not referenced by any formula (stale links from broken/moved files).
+   - `scan_scenarios()` — Excel Scenario Manager entries (`<scenarios>` XML) — named sets of input cell values never visible in formulas.
+   - `detect_xlsb_files()` — Flags `.xlsb` binary files (ZIP-incompatible; formula/vector scan not possible without `pyxlsb`).
+   - `get_vector_context()` — Reads the column header (row above) and row label (column A beside) for each unmatched vector to give analysts context.
+
+**Models (`pipeline/models.py`):**
+
+| Class | Description |
+|-------|-------------|
+| `SourceNode` | A file in the dependency graph with `level`, `found_on_disk` |
+| `FormulaRef` | One external formula reference with `level`, `ref_origin` (formula/chart/data_validation) |
+| `MissingFile` | Referenced file not on disk; `transitive_unknown=True` means its own deps are also invisible |
+| `MatchedVector` | Hardcoded vector with confirmed upstream source (exact/subsequence/approximate) |
+| `UnmatchedVector` | Hardcoded vector with no match; includes `column_header` and `row_label` context |
+| `RawSource` | ODBC/OLE DB/PQ/file connection harvested by ExcelLineageDetector |
+| `DynamicRef` | INDIRECT formula with runtime-assembled filename |
+| `RTDRef` | RTD live COM feed call with `prog_id` |
+| `PhantomLink` | Stale `xl/externalLinks/` entry not used by any formula |
+| `XlsbWarning` | `.xlsb` file that cannot be fully analysed |
+| `ScenarioEntry` | Scenario Manager entry with `input_cells: list[tuple[cell_ref, value]]` |
+| `DetectionResult` | Top-level result aggregating all of the above |
+
+**Config (`RawSourcesDetection/config.json`):**
+```json
+{
+    "model_sheets": [],
+    "max_formula_levels": 5,
+    "matching": {
+        "exact": true,
+        "approximate": false,
+        "exact_decimal_places": 8,
+        "subsequence_matching": true,
+        "min_similarity": 0.85,
+        "similarity_metric": "pearson"
+    },
+    "performance": {
+        "max_workers": null,
+        "min_vector_length": 3
+    }
+}
+```
+
+**Output report (9 sheets):**
+
+| Sheet | Contents |
+|-------|----------|
+| Summary | Run settings + counts for all categories |
+| Required Inputs | Deduplicated "shopping list" of everything needed to run the model (formula-linked files + ODBC/PQ connections). Excludes `input`/`metadata` categories. |
+| Formula Dependency Tree | All external formula refs with level, source/target, found-on-disk, ref_origin |
+| Missing Files | Files referenced but not on disk; includes Transitive Unknown column |
+| Matched Vectors | Hardcoded vectors matched to upstream source (green=exact, blue=approx) |
+| Unmatched Vectors | Unmatched vectors with Column Header + Row Label context |
+| Dynamic References | Dynamic INDIRECT refs + RTD live feed calls |
+| Stale Links | Phantom xl/externalLinks/ entries with break-link recommendation |
+| Scenarios | Excel Scenario Manager entries (hidden input value sets) |
+
+**Required Inputs deduplication rules:**
+- Formula-traced Excel files are listed first (one row per unique filename, green=found, red=missing).
+- `raw_sources` with `category` in `{input, metadata, hardcoded}` are excluded — these are not external data sources.
+- File-type raw_sources skip if the basename already appears in the formula_refs section.
+- Non-file raw_sources deduplicate by `category|sub_type|connection_string`.
