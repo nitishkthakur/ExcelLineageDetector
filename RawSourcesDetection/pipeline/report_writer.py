@@ -1,12 +1,15 @@
 """Excel report writer for RawSourcesDetection results.
 
-Produces a 6-sheet workbook:
+Produces an 8-sheet workbook:
   1. Summary              — run settings and stats
-  2. Required Inputs      — full dump of every upstream source that must be supplied
+  2. Required Inputs      — every upstream source that must be supplied
   3. Formula Dependency   — all external formula references by level
   4. Missing Files        — referenced files not found on disk
   5. Matched Vectors      — hardcoded vectors with confirmed source
-  6. Unmatched Vectors    — hardcoded vectors with no source found
+  6. Unmatched Vectors    — hardcoded vectors with no source found (+ context)
+  7. Dynamic References   — INDIRECT / RTD / invisible live data feeds
+  8. Stale Links          — phantom xl/externalLinks/ no longer used by formulas
+  9. Scenarios            — Excel Scenario Manager entries (hidden inputs)
 """
 from __future__ import annotations
 
@@ -33,6 +36,12 @@ _DB_FILL     = "E3F2FD"   # blue — database / ODBC / OLE DB
 _FILE_FILL   = "E8F5E9"   # green — file reference
 _PQ_FILL     = "FFF3E0"   # orange — Power Query
 _OTHER_FILL  = "F3E5F5"   # purple — other categories
+_DYN_FILL    = "FFE0B2"   # orange — dynamic / invisible reference
+_DYN_ALT     = "FFF3E0"   # lighter orange — alternating
+_STALE_FILL  = "E0E0E0"   # grey — stale/phantom link
+_STALE_ALT   = "F5F5F5"   # lighter grey — alternating
+_SCEN_FILL   = "E8EAF6"   # indigo tint — scenario
+_SCEN_ALT    = "F3E5F5"   # lighter — alternating
 
 
 # Map category → background colour for Required Inputs sheet
@@ -42,6 +51,9 @@ _CAT_FILL = {
     "file":       _FILE_FILL,
     "formula":    _FILE_FILL,
 }
+
+# Categories to EXCLUDE from Required Inputs (not external data sources)
+_SKIP_CATEGORIES = {"input", "metadata", "hardcoded"}
 
 # Map match_type → background colour for Matched Vectors sheet
 _MATCH_FILL = {
@@ -136,7 +148,7 @@ def write_report(
     # Sheet 1: Summary
     # ========================================================================
     ws = wb.create_sheet("Summary")
-    ws.column_dimensions["A"].width = 32
+    ws.column_dimensions["A"].width = 36
     ws.column_dimensions["B"].width = 50
 
     ws["A1"] = "RawSourcesDetection Report"
@@ -144,6 +156,12 @@ def write_report(
     ws.merge_cells("A1:B1")
 
     n_found = sum(1 for n in result.source_nodes if n.found_on_disk and n.level > 0)
+
+    # Count connections excluding internal/metadata noise
+    visible_sources = [
+        s for s in result.raw_sources
+        if s.category not in _SKIP_CATEGORIES
+    ]
 
     rows: list[tuple[str, object]] = [
         ("", ""),
@@ -166,16 +184,23 @@ def write_report(
         ("Vectors Unmatched", len(result.unmatched_vectors)),
         ("", ""),
         ("── Connection Harvesting ──", ""),
-        ("Raw Sources Found", len(result.raw_sources)),
+        ("Raw Sources Found", len(visible_sources)),
         ("  — Database / ODBC / OLE DB",
-         sum(1 for s in result.raw_sources if s.category == "database")),
+         sum(1 for s in visible_sources if s.category == "database")),
         ("  — Power Query",
-         sum(1 for s in result.raw_sources if s.category == "powerquery")),
+         sum(1 for s in visible_sources if s.category == "powerquery")),
         ("  — File References",
-         sum(1 for s in result.raw_sources if s.category == "file")),
+         sum(1 for s in visible_sources if s.category == "file")),
         ("  — Other",
-         sum(1 for s in result.raw_sources
+         sum(1 for s in visible_sources
              if s.category not in ("database", "powerquery", "file"))),
+        ("", ""),
+        ("── Extra Scanners ──", ""),
+        ("Dynamic INDIRECT refs", len(result.dynamic_refs)),
+        ("RTD (live feed) refs", len(result.rtd_refs)),
+        ("Stale / phantom links", len(result.phantom_links)),
+        ("XLSB files (limited scan)", len(result.xlsb_warnings)),
+        ("Scenario Manager entries", len(result.scenarios)),
     ]
 
     lbl_font = Font(bold=True, size=10)
@@ -211,8 +236,27 @@ def write_report(
         cell(ws, ri, 6, f"{ref.source_sheet}!{ref.source_cell}" if ref.source_cell else ref.source_sheet, f)
         ri += 1
 
-    # Part B: ODBC / OLE DB / Power Query / other connections from all files
+    # Part B: ODBC / OLE DB / Power Query / other connections
+    # Skip 'input', 'metadata' categories — not external data sources
     for src in result.raw_sources:
+        if src.category in _SKIP_CATEGORIES:
+            continue
+        # Skip if same file already listed from formula_refs section
+        # (avoid double-listing a .xlsx that appears as both formula ref and file connection)
+        conn_lower = src.connection.lower()
+        # Use connection string as dedup key for non-file types; filename for file types
+        if src.category in ("file", "formula"):
+            import os
+            conn_key = os.path.basename(conn_lower)
+            if conn_key in seen_req:
+                continue
+            seen_req.add(conn_key)
+        else:
+            key = f"{src.category}|{src.sub_type}|{conn_lower}"
+            if key in seen_req:
+                continue
+            seen_req.add(key)
+
         f = pfill(_CAT_FILL.get(src.category, _OTHER_FILL))
         cell(ws, ri, 1, src.category, f)
         cell(ws, ri, 2, src.sub_type, f)
@@ -231,8 +275,8 @@ def write_report(
     hdr(ws,
         ["Level", "Source File", "Source Sheet", "Source Cell",
          "Target File", "Target Sheet", "Target Range",
-         "Found on Disk", "Resolved Path"],
-        [8, 24, 20, 12, 24, 20, 18, 14, 42])
+         "Found on Disk", "Ref Origin", "Resolved Path"],
+        [8, 24, 20, 12, 24, 20, 18, 14, 16, 42])
 
     for ri, ref in enumerate(result.formula_refs, 2):
         f = pfill(_FOUND_FILL if ref.file_found else _MISSING_FILL)
@@ -244,7 +288,8 @@ def write_report(
         cell(ws, ri, 6, ref.target_sheet, f)
         cell(ws, ri, 7, ref.target_range, f)
         cell(ws, ri, 8, "Yes" if ref.file_found else "NO", f)
-        cell(ws, ri, 9, ref.resolved_path, f)
+        cell(ws, ri, 9, getattr(ref, "ref_origin", "formula"), f)
+        cell(ws, ri, 10, ref.resolved_path, f)
 
     autowidth(ws)
 
@@ -254,8 +299,9 @@ def write_report(
     ws = wb.create_sheet("Missing Files")
     hdr(ws,
         ["Missing File", "Level", "Referenced By",
-         "Sheets Needed", "Cells Referencing (first 10)"],
-        [32, 8, 28, 32, 44])
+         "Sheets Needed", "Cells Referencing (first 10)",
+         "Transitive Unknown"],
+        [32, 8, 28, 32, 44, 20])
 
     for ri, mf in enumerate(result.missing_files, 2):
         f = pfill(_MISSING_FILL if ri % 2 == 0 else _MISS_ALT)
@@ -265,6 +311,11 @@ def write_report(
         cell(ws, ri, 4, ", ".join(mf.sheets_needed), f, wrap=True)
         refs_text = "\n".join(mf.cells_referencing[:10])
         cell(ws, ri, 5, refs_text, f, wrap=True)
+        transitive_note = (
+            "YES — all dependencies of this file are invisible until it is supplied"
+            if mf.transitive_unknown else "No"
+        )
+        cell(ws, ri, 6, transitive_note, f, wrap=True)
         if mf.cells_referencing:
             ws.row_dimensions[ri].height = min(15 * min(len(mf.cells_referencing), 10), 80)
 
@@ -296,23 +347,124 @@ def write_report(
     autowidth(ws)
 
     # ========================================================================
-    # Sheet 6: Unmatched Vectors
+    # Sheet 6: Unmatched Vectors (with context)
     # ========================================================================
     ws = wb.create_sheet("Unmatched Vectors")
     hdr(ws,
         ["Model Sheet", "Model Range", "Length",
+         "Column Header", "Row Label",
          "Sample Values (first 5)", "Action Required"],
-        [18, 14, 8, 36, 48])
+        [18, 14, 8, 24, 24, 36, 48])
 
     for ri, uv in enumerate(result.unmatched_vectors, 2):
         f = pfill(_UNMATCH_FILL if ri % 2 == 0 else _UNMATCH_ALT)
         cell(ws, ri, 1, uv.model_sheet, f)
         cell(ws, ri, 2, uv.model_range, f)
         cell(ws, ri, 3, uv.model_length, f)
-        cell(ws, ri, 4, _fmt_sample(uv.model_sample), f)
-        cell(ws, ri, 5, "No source found — verify manually or supply upstream file", f)
+        cell(ws, ri, 4, getattr(uv, "column_header", ""), f)
+        cell(ws, ri, 5, getattr(uv, "row_label", ""), f)
+        cell(ws, ri, 6, _fmt_sample(uv.model_sample), f)
+        cell(ws, ri, 7, "No source found — verify manually or supply upstream file", f)
 
     autowidth(ws)
+
+    # ========================================================================
+    # Sheet 7: Dynamic References
+    # (INDIRECT with runtime-assembled filenames + RTD live COM feeds)
+    # ========================================================================
+    ws = wb.create_sheet("Dynamic References")
+
+    has_dynamic = result.dynamic_refs or result.rtd_refs
+    if not has_dynamic:
+        ws["A1"] = "No dynamic references detected."
+        ws["A1"].font = Font(italic=True, size=10)
+    else:
+        hdr(ws,
+            ["Type", "Source File", "Source Sheet", "Source Cell",
+             "ProgID / Detail", "Formula (truncated)", "Note"],
+            [14, 26, 20, 12, 24, 50, 48])
+
+        ri = 2
+        for dr in result.dynamic_refs:
+            f = pfill(_DYN_FILL if ri % 2 == 0 else _DYN_ALT)
+            cell(ws, ri, 1, "INDIRECT (dynamic)", f, bold=True)
+            cell(ws, ri, 2, dr.source_file, f)
+            cell(ws, ri, 3, dr.source_sheet, f)
+            cell(ws, ri, 4, dr.source_cell, f)
+            cell(ws, ri, 5, "", f)
+            cell(ws, ri, 6, dr.formula, f, wrap=True)
+            cell(ws, ri, 7, dr.note, f, wrap=True)
+            ri += 1
+        for rr in result.rtd_refs:
+            f = pfill(_DYN_FILL if ri % 2 == 0 else _DYN_ALT)
+            cell(ws, ri, 1, "RTD (live feed)", f, bold=True)
+            cell(ws, ri, 2, rr.source_file, f)
+            cell(ws, ri, 3, rr.source_sheet, f)
+            cell(ws, ri, 4, rr.source_cell, f)
+            cell(ws, ri, 5, rr.prog_id, f)
+            cell(ws, ri, 6, rr.formula, f, wrap=True)
+            cell(ws, ri, 7, "Requires live COM server — not a file dependency", f, wrap=True)
+            ri += 1
+
+        autowidth(ws)
+
+    # ========================================================================
+    # Sheet 8: Stale Links
+    # ========================================================================
+    ws = wb.create_sheet("Stale Links")
+
+    if not result.phantom_links:
+        ws["A1"] = "No stale external links detected."
+        ws["A1"].font = Font(italic=True, size=10)
+    else:
+        hdr(ws,
+            ["Source File", "Stale Linked File", "Recommendation"],
+            [32, 44, 52])
+
+        for ri, pl in enumerate(result.phantom_links, 2):
+            f = pfill(_STALE_FILL if ri % 2 == 0 else _STALE_ALT)
+            cell(ws, ri, 1, pl.source_file, f)
+            cell(ws, ri, 2, pl.stale_filename, f, bold=True)
+            cell(ws, ri, 3,
+                 "Remove via Excel → Data → Edit Links → Break Link. "
+                 "File is registered but not referenced by any formula.", f, wrap=True)
+
+        autowidth(ws)
+
+    # ========================================================================
+    # Sheet 9: Scenarios
+    # ========================================================================
+    ws = wb.create_sheet("Scenarios")
+
+    if not result.scenarios:
+        ws["A1"] = "No Excel Scenario Manager entries detected."
+        ws["A1"].font = Font(italic=True, size=10)
+    else:
+        hdr(ws,
+            ["Source File", "Sheet", "Scenario Name", "Input Cell", "Value"],
+            [28, 20, 28, 14, 24])
+
+        ri = 2
+        for se in result.scenarios:
+            base_f = pfill(_SCEN_FILL if ri % 2 == 0 else _SCEN_ALT)
+            if not se.input_cells:
+                cell(ws, ri, 1, se.source_file, base_f)
+                cell(ws, ri, 2, se.sheet_name, base_f)
+                cell(ws, ri, 3, se.scenario_name, base_f, bold=True)
+                cell(ws, ri, 4, "(no cells)", base_f)
+                cell(ws, ri, 5, "", base_f)
+                ri += 1
+            else:
+                for idx, (cell_ref, value) in enumerate(se.input_cells):
+                    f = pfill(_SCEN_FILL if ri % 2 == 0 else _SCEN_ALT)
+                    cell(ws, ri, 1, se.source_file if idx == 0 else "", f)
+                    cell(ws, ri, 2, se.sheet_name if idx == 0 else "", f)
+                    cell(ws, ri, 3, se.scenario_name if idx == 0 else "", f, bold=(idx == 0))
+                    cell(ws, ri, 4, cell_ref, f)
+                    cell(ws, ri, 5, value, f)
+                    ri += 1
+
+        autowidth(ws)
 
     # ── Save ────────────────────────────────────────────────────────────────
     wb.save(str(out_path))

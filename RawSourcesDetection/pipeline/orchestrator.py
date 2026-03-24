@@ -19,12 +19,17 @@ from pathlib import Path
 from .config import RSDConfig
 from .models import (
     DetectionResult,
+    DynamicRef,
     FormulaRef,
     MatchedVector,
     MissingFile,
+    PhantomLink,
+    RTDRef,
     RawSource,
+    ScenarioEntry,
     SourceNode,
     UnmatchedVector,
+    XlsbWarning,
 )
 
 
@@ -239,6 +244,144 @@ def _harvest_connections(files: list[Path], verbose: bool) -> list[RawSource]:
 
 
 # ---------------------------------------------------------------------------
+# Step 4: Extra scanners — gaps not covered by steps 1–3
+# ---------------------------------------------------------------------------
+
+def _run_extra_scanners(
+    model_path: Path,
+    model_sheets: list[str],
+    all_files: list[Path],
+    inputs_dir: Path,
+    search_dirs: list[Path],
+    formula_refs: list[FormulaRef],
+    unmatched_vectors: list[UnmatchedVector],
+    missing_files: list[MissingFile],
+    verbose: bool,
+) -> tuple[
+    list[DynamicRef],
+    list[RTDRef],
+    list[PhantomLink],
+    list[XlsbWarning],
+    list[ScenarioEntry],
+    list[FormulaRef],       # formula_refs augmented with chart + data-validation refs
+    list[UnmatchedVector],  # unmatched_vectors augmented with context
+]:
+    """Run all supplementary scanners and merge results into the main collections."""
+    from .extra_scanners import (
+        detect_phantom_links,
+        detect_xlsb_files,
+        get_vector_context,
+        scan_chart_external_refs,
+        scan_data_validation_refs,
+        scan_dynamic_indirect_refs,
+        scan_rtd_refs,
+        scan_scenarios,
+    )
+
+    dynamic_refs: list[DynamicRef] = []
+    rtd_refs: list[RTDRef] = []
+    phantom_links: list[PhantomLink] = []
+    xlsb_warnings: list[XlsbWarning] = []
+    scenarios: list[ScenarioEntry] = []
+
+    # Set of files already referenced by formula_refs (for phantom link detection)
+    formula_ref_files: set[str] = {r.target_file.lower() for r in formula_refs}
+
+    for file_path in all_files:
+        if not file_path.exists():
+            continue
+        fname = file_path.name.lower()
+        if fname.endswith(".xlsb"):
+            continue   # handled by detect_xlsb_files
+
+        # Dynamic INDIRECT — only model file, only user-specified sheets
+        if file_path == model_path:
+            try:
+                dynamic_refs.extend(
+                    scan_dynamic_indirect_refs(file_path, model_sheets=model_sheets)
+                )
+            except Exception:
+                pass
+
+        # RTD functions — all files
+        try:
+            rtd_refs.extend(scan_rtd_refs(file_path))
+        except Exception:
+            pass
+
+        # Chart external refs — all files; merge into formula_refs
+        try:
+            chart_refs = scan_chart_external_refs(file_path, search_dirs=search_dirs)
+            for r in chart_refs:
+                # Check for duplicates before appending
+                dup = any(
+                    x.source_sheet == r.source_sheet and x.source_cell == r.source_cell
+                    and x.target_file.lower() == r.target_file.lower()
+                    and x.target_sheet.lower() == r.target_sheet.lower()
+                    for x in formula_refs
+                )
+                if not dup:
+                    formula_refs.append(r)
+                    formula_ref_files.add(r.target_file.lower())
+        except Exception:
+            pass
+
+        # Data validation external refs — all files; merge into formula_refs
+        try:
+            dv_refs = scan_data_validation_refs(file_path, search_dirs=search_dirs)
+            for r in dv_refs:
+                dup = any(
+                    x.source_sheet == r.source_sheet and x.source_cell == r.source_cell
+                    and x.target_file.lower() == r.target_file.lower()
+                    for x in formula_refs
+                )
+                if not dup:
+                    formula_refs.append(r)
+                    formula_ref_files.add(r.target_file.lower())
+        except Exception:
+            pass
+
+        # Phantom links — all files
+        try:
+            phantom_links.extend(detect_phantom_links(file_path, formula_ref_files))
+        except Exception:
+            pass
+
+        # Scenarios — all files
+        try:
+            scenarios.extend(scan_scenarios(file_path))
+        except Exception:
+            pass
+
+    # XLSB detection: scan inputs_dir + check formula_refs for any .xlsb targets
+    try:
+        xlsb_warnings.extend(detect_xlsb_files(inputs_dir, formula_refs))
+    except Exception:
+        pass
+
+    # Enrich unmatched vectors with column header + row label context
+    enriched: list[UnmatchedVector] = []
+    for uv in unmatched_vectors:
+        # start_cell is the first cell of model_range (e.g. "B2:B10" → "B2")
+        start_cell = uv.model_range.split(":")[0] if ":" in uv.model_range else uv.model_range
+        try:
+            col_hdr, row_lbl = get_vector_context(model_path, uv.model_sheet, start_cell)
+        except Exception:
+            col_hdr, row_lbl = "", ""
+        enriched.append(UnmatchedVector(
+            model_sheet=uv.model_sheet,
+            model_range=uv.model_range,
+            model_length=uv.model_length,
+            model_sample=uv.model_sample,
+            column_header=col_hdr,
+            row_label=row_lbl,
+        ))
+
+    return (dynamic_refs, rtd_refs, phantom_links, xlsb_warnings,
+            scenarios, formula_refs, enriched)
+
+
+# ---------------------------------------------------------------------------
 # Main entry point
 # ---------------------------------------------------------------------------
 
@@ -321,6 +464,31 @@ def run(
             f"  {len(raw_sources)} unique connections"
             f"  [{time.perf_counter() - t3:.2f}s]"
         )
+
+    # ── Step 4: Extra scanners ───────────────────────────────────────────────
+    t4 = time.perf_counter()
+    if verbose:
+        print(f"\n[Step 4] Extra scanners (INDIRECT, RTD, charts, phantom links, scenarios) ...")
+
+    (dynamic_refs, rtd_refs, phantom_links, xlsb_warnings,
+     scenarios, formula_refs, unmatched_vectors) = _run_extra_scanners(
+        model_path=model_path,
+        model_sheets=config.model_sheets,
+        all_files=all_files,
+        inputs_dir=inputs_dir,
+        search_dirs=search_dirs,
+        formula_refs=formula_refs,
+        unmatched_vectors=unmatched_vectors,
+        missing_files=missing_files,
+        verbose=verbose,
+    )
+
+    if verbose:
+        print(
+            f"  {len(dynamic_refs)} dynamic INDIRECT, {len(rtd_refs)} RTD, "
+            f"{len(phantom_links)} phantom links, {len(xlsb_warnings)} xlsb, "
+            f"{len(scenarios)} scenarios  [{time.perf_counter() - t4:.2f}s]"
+        )
         print(f"\nTotal: {time.perf_counter() - t0:.2f}s")
 
     return DetectionResult(
@@ -331,4 +499,9 @@ def run(
         matched_vectors=matched_vectors,
         unmatched_vectors=unmatched_vectors,
         raw_sources=raw_sources,
+        dynamic_refs=dynamic_refs,
+        rtd_refs=rtd_refs,
+        phantom_links=phantom_links,
+        xlsb_warnings=xlsb_warnings,
+        scenarios=scenarios,
     )
